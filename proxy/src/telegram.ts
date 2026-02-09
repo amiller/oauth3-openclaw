@@ -163,19 +163,27 @@ Hash: ${codeHash.substring(0, 16)}...`;
       const status = result.success ? '✅ Success' : '❌ Failed';
       const duration = result.duration ? `${result.duration}ms` : 'N/A';
       
+      // Log execution result to console
+      console.log('\n📊 Execution Result:');
+      console.log(`  Status: ${status}`);
+      console.log(`  Duration: ${duration}`);
+      if (result.stdout) console.log(`  Stdout: ${result.stdout}`);
+      if (result.stderr) console.log(`  Stderr: ${result.stderr}`);
+      if (result.error) console.log(`  Error: ${result.error}`);
+      
       let message = `${status}\n\nRequest: ${requestId}\nDuration: ${duration}`;
       
       if (result.success && result.stdout) {
         const output = result.stdout.substring(0, 500);
-        message += `\n\nOutput:\n\`\`\`\n${output}\n\`\`\``;
+        message += `\n\nOutput:\n${output}`;
       } else if (result.error) {
         message += `\n\nError: ${result.error}`;
       }
 
       await this.bot.editMessageText(message, {
         chat_id: this.chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown'
+        message_id: messageId
+        // No parse_mode - plain text to avoid markdown escaping issues
       });
     } catch (error) {
       console.error('Failed to update message:', error);
