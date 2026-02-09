@@ -301,8 +301,15 @@ Hash: ${codeHash.substring(0, 16)}...`;
       
       // Disable auto-delete now that secret is received
       try {
-        // TypeScript types are outdated, but method exists in API
-        await (this.bot as any).setChatMessageAutoDeleteTime(msg.chat.id, 0);
+        const token = (this.bot as any).token;
+        await fetch(`https://api.telegram.org/bot${token}/setChatMessageAutoDeleteTime`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: msg.chat.id,
+            message_auto_delete_time: 0
+          })
+        });
         console.log('🔓 Disabled disappearing messages');
       } catch (disableError) {
         console.warn('Could not disable auto-delete:', disableError);
@@ -327,9 +334,16 @@ Hash: ${codeHash.substring(0, 16)}...`;
 
   async requestSecret(requestId: string, secretName: string): Promise<void> {
     try {
-      // Enable auto-delete for 60 seconds
-      // TypeScript types are outdated, but method exists in API
-      await (this.bot as any).setChatMessageAutoDeleteTime(this.chatId, 60);
+      // Enable auto-delete for 60 seconds via direct API call
+      const token = (this.bot as any).token;
+      await fetch(`https://api.telegram.org/bot${token}/setChatMessageAutoDeleteTime`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: this.chatId,
+          message_auto_delete_time: 60
+        })
+      });
       console.log('🔒 Enabled disappearing messages (60s)');
       
       const message = `🔑 Missing Secret Required
