@@ -4,10 +4,7 @@
 
 import TelegramBot from 'node-telegram-bot-api';
 import { ProxyDatabase } from './database.js';
-import { exec } from 'child_process';
-import { promisify } from 'util';
-
-const execAsync = promisify(exec);
+import { appendFile } from 'fs/promises';
 
 export class TelegramApprovalBot {
   private bot: TelegramBot;
@@ -34,9 +31,11 @@ export class TelegramApprovalBot {
 
   private async notifyAgent(message: string): Promise<void> {
     try {
-      // Trigger OpenClaw cron wake event to notify the agent
-      await execAsync(`openclaw cron wake --text "${message.replace(/"/g, '\\"')}" --mode now`);
-      console.log('✅ Agent notified via cron wake');
+      // Write notification to file for agent to check via heartbeat
+      const timestamp = new Date().toISOString();
+      const notif = `${timestamp} ${message}\n`;
+      await appendFile('/tmp/oauth3-notifications.log', notif);
+      console.log('✅ Agent notification logged:', message);
     } catch (error) {
       console.error('Failed to notify agent:', error);
     }
