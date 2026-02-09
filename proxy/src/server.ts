@@ -221,11 +221,30 @@ async function executeInBackground(
 
     // Build secrets object
     const secretValues: Record<string, string> = {};
+    const missingSecrets: string[] = [];
+    
     for (const secretName of requiredSecrets) {
       if (!secrets[secretName]) {
-        throw new Error(`Missing secret: ${secretName}`);
+        missingSecrets.push(secretName);
+      } else {
+        secretValues[secretName] = secrets[secretName];
       }
-      secretValues[secretName] = secrets[secretName];
+    }
+    
+    // If secrets are missing, request them from the user
+    if (missingSecrets.length > 0) {
+      console.log(`  Missing secrets: ${missingSecrets.join(', ')}`);
+      db.updateRequestStatus(requestId, 'awaiting_secrets');
+      
+      // Request each missing secret
+      for (const secretName of missingSecrets) {
+        if (telegramBot) {
+          await telegramBot.requestSecret(requestId, secretName);
+        }
+      }
+      
+      console.log(`  ⏸️ Execution paused - waiting for secrets from user`);
+      return; // Don't throw error, just wait for secrets
     }
 
     // Execute

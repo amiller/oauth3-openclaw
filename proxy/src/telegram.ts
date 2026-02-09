@@ -13,6 +13,7 @@ export class TelegramApprovalBot {
   private onApproval: (requestId: string, level: 'once' | '24h' | 'forever') => void;
   private onDenial: (requestId: string) => void;
   private secretStore: Record<string, string>;
+  private pendingSecretRequests: Map<string, { requestId: string; secretName: string }>;
 
   constructor(
     token: string,
@@ -28,6 +29,7 @@ export class TelegramApprovalBot {
     this.secretStore = secretStore;
     this.onApproval = onApproval;
     this.onDenial = onDenial;
+    this.pendingSecretRequests = new Map();
 
     this.setupHandlers();
   }
@@ -108,6 +110,12 @@ export class TelegramApprovalBot {
       
       // Only respond to messages from the configured chat
       if (msg.chat.id.toString() !== this.chatId) {
+        return;
+      }
+      
+      // Check if this is a reply to a secret request
+      if (msg.reply_to_message) {
+        await this.handleSecretReply(msg);
         return;
       }
       
@@ -265,6 +273,78 @@ Hash: ${codeHash.substring(0, 16)}...`;
     } catch (error) {
       console.error('Error listing secrets:', error);
       await this.bot.sendMessage(msg.chat.id, '❌ Failed to list secrets');
+    }
+  }
+
+  private async handleSecretReply(msg: TelegramBot.Message): Promise<void> {
+    try {
+      const replyToId = msg.reply_to_message?.message_id;
+      if (!replyToId) return;
+      
+      const requestKey = replyToId.toString();
+      const pending = this.pendingSecretRequests.get(requestKey);
+      
+      if (!pending) {
+        // Not a reply to a secret request
+        return;
+      }
+      
+      const secretValue = msg.text || '';
+      if (!secretValue) {
+        await this.bot.sendMessage(msg.chat.id, '❌ Secret value cannot be empty');
+        return;
+      }
+      
+      // Store the secret
+      this.secretStore[pending.secretName] = secretValue;
+      this.pendingSecretRequests.delete(requestKey);
+      
+      // Delete the user's message for security
+      try {
+        await this.bot.deleteMessage(msg.chat.id, msg.message_id);
+      } catch (deleteError) {
+        console.warn('Could not delete message:', deleteError);
+      }
+      
+      // Confirm and retry execution
+      await this.bot.sendMessage(
+        msg.chat.id,
+        `✅ Secret received: ${pending.secretName}\n\n🔄 Retrying execution for request ${pending.requestId}...`
+      );
+      
+      console.log(`🔐 Secret provided via reply: ${pending.secretName} (length: ${secretValue.length})`);
+      
+      // Trigger retry - call the approval callback again
+      this.onApproval(pending.requestId, 'once');
+      
+    } catch (error) {
+      console.error('Error handling secret reply:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ Failed to process secret');
+    }
+  }
+
+  async requestSecret(requestId: string, secretName: string): Promise<void> {
+    try {
+      const message = `🔑 Missing Secret Required
+
+Request: ${requestId}
+Secret: ${secretName}
+
+Please reply to this message with the value for ${secretName}.
+
+Your message will be automatically deleted for security.`;
+
+      const sent = await this.bot.sendMessage(this.chatId, message);
+      
+      // Track this request
+      this.pendingSecretRequests.set(sent.message_id.toString(), {
+        requestId,
+        secretName
+      });
+      
+      console.log(`📨 Requested secret ${secretName} for ${requestId}`);
+    } catch (error) {
+      console.error('Error requesting secret:', error);
     }
   }
 

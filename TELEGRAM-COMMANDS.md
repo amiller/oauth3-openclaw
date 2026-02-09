@@ -1,8 +1,35 @@
 # Telegram Bot Commands
 
-The OAuth3 proxy includes a Telegram bot that supports the following commands:
+The OAuth3 proxy includes a Telegram bot that supports both manual secret management and automatic prompting when secrets are needed.
 
-## Secret Management
+## Automatic Secret Prompts (Recommended)
+
+When an execution requires a secret that isn't stored, the bot will automatically prompt you:
+
+```
+🔑 Missing Secret Required
+
+Request: exec_abc123...
+Secret: OPENAI_API_KEY
+
+Please reply to this message with the value for OPENAI_API_KEY.
+
+Your message will be automatically deleted for security.
+```
+
+**To provide the secret:**
+1. Tap "Reply" on the bot's message
+2. Type or paste the secret value
+3. Send
+
+The bot will:
+- Store the secret
+- Delete your message for security
+- Retry the execution automatically
+
+This is the easiest way to add secrets - no need to remember command syntax!
+
+## Manual Secret Management (Optional)
 
 ### `/add_secret SECRET_NAME secret_value`
 
