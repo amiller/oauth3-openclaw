@@ -71,7 +71,7 @@ export function parseMetadata(code: string): SkillMetadata | null {
 }
 
 /**
- * Execute skill in Deno sandbox
+ * Execute skill in Deno sandbox using Docker
  */
 export async function executeSkill(request: ExecutionRequest): Promise<ExecutionResult> {
   const startTime = Date.now();
@@ -85,32 +85,41 @@ export async function executeSkill(request: ExecutionRequest): Promise<Execution
     const timeout = request.timeout || 30;
     const networks = request.allowedNetworks || [];
     
-    // Build Deno command
-    const denoArgs = [
+    // Build Docker command
+    const dockerArgs = [
       'run',
-      '--no-prompt',
-      '--quiet'
+      '--rm',
+      '--read-only',
+      '--network', networks.length > 0 ? 'bridge' : 'none',
+      '--memory', '256m',
+      '--cpus', '0.5',
+      '-v', `${tmpFile}:/app/script.ts:ro`
     ];
 
-    // Add network permissions
+    // Add environment variables for secrets
+    for (const [key, value] of Object.entries(request.secrets)) {
+      dockerArgs.push('-e', `${key}=${value}`);
+    }
+
+    // Use official Deno Docker image
+    dockerArgs.push('denoland/deno:latest');
+    dockerArgs.push('run', '--no-prompt', '--quiet');
+
+    // Add network permissions if specified
     if (networks.length > 0) {
-      denoArgs.push(`--allow-net=${networks.join(',')}`);
+      dockerArgs.push(`--allow-net=${networks.join(',')}`);
     }
 
     // Add env permissions for secrets
     if (Object.keys(request.secrets).length > 0) {
-      denoArgs.push(`--allow-env=${Object.keys(request.secrets).join(',')}`);
+      dockerArgs.push(`--allow-env=${Object.keys(request.secrets).join(',')}`);
     }
 
-    denoArgs.push(tmpFile);
+    dockerArgs.push('/app/script.ts');
 
     // Execute with timeout
-    const { stdout, stderr } = await execFileAsync('deno', denoArgs, {
+    const { stdout, stderr } = await execFileAsync('docker', dockerArgs, {
       timeout: timeout * 1000,
-      env: {
-        ...process.env,
-        ...request.secrets,
-      },
       maxBuffer: 1024 * 1024 // 1MB
     });
 
@@ -143,11 +152,11 @@ export async function executeSkill(request: ExecutionRequest): Promise<Execution
 }
 
 /**
- * Test if Deno is available
+ * Test if Docker is available
  */
 export async function checkDeno(): Promise<boolean> {
   try {
-    await execFileAsync('deno', ['--version']);
+    await execFileAsync('docker', ['--version']);
     return true;
   } catch {
     return false;
