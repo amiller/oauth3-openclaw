@@ -2,6 +2,7 @@
  * HTTP API Server for Execution Proxy
  */
 
+import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import { ProxyDatabase } from './database.js';
 import { executeSkill, hashCode, parseMetadata } from './executor.js';
