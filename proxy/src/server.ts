@@ -210,8 +210,13 @@ async function executeInBackground(
   metadata: any,
   requiredSecrets: string[]
 ) {
+  console.log(`\n🚀 Starting background execution for ${requestId}`);
+  console.log(`  Metadata:`, metadata);
+  console.log(`  Required secrets:`, requiredSecrets);
+  
   try {
     db.updateRequestStatus(requestId, 'executing');
+    console.log(`  Status updated to 'executing'`);
 
     // Build secrets object
     const secretValues: Record<string, string> = {};
@@ -223,12 +228,14 @@ async function executeInBackground(
     }
 
     // Execute
+    console.log(`  Calling executeSkill...`);
     const result = await executeSkill({
       code,
       secrets: secretValues,
       timeout: metadata.timeout || 30,
       allowedNetworks: metadata.network || []
     });
+    console.log(`  Execution complete:`, result.success ? '✅' : '❌');
 
     // Store result
     db.updateRequestResult(requestId, {
@@ -251,6 +258,8 @@ async function executeInBackground(
     }
 
   } catch (error: any) {
+    console.error(`❌ Execution failed for ${requestId}:`, error.message);
+    console.error(`  Stack:`, error.stack);
     db.updateRequestResult(requestId, null, error.message);
   }
 }

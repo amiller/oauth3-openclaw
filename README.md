@@ -4,6 +4,10 @@
 
 OAuth3-OpenClaw provides a secure execution proxy that enables AI agents to request access to secrets (API keys, tokens, credentials) with explicit human approval via Telegram. The agent submits code for execution, you review and approve via inline buttons, and the proxy runs the code in an isolated Docker sandbox with time-limited secret access.
 
+🔗 **GitHub:** https://github.com/claw-tee-dah/oauth3-openclaw  
+📋 **Status:** ✅ Fully functional (see [TESTING-RESULTS.md](./TESTING-RESULTS.md))  
+📖 **Host Setup:** See [DEPLOYMENT.md](./DEPLOYMENT.md) for step-by-step instructions
+
 ## Why OAuth3?
 
 Traditional OAuth requires the service provider to implement flows and trust boundaries. **OAuth3** inverts this: the **resource owner** (you) runs the authorization server, and agents request delegated access through human approval. Think of it as "OAuth for AI agents where you are the provider."
@@ -82,9 +86,26 @@ Key properties:
 
 ## Quick Start
 
-### For Users (Deploy the Proxy)
+### 🚀 For Host (Deploy the Proxy)
 
-See [DEPLOYMENT.md](./DEPLOYMENT.md) for step-by-step setup instructions.
+**→ See [DEPLOYMENT.md](./DEPLOYMENT.md) for complete step-by-step instructions.**
+
+**TL;DR:**
+```bash
+git clone https://github.com/claw-tee-dah/oauth3-openclaw.git
+cd oauth3-openclaw/proxy
+npm install
+cp .env.example .env
+# Edit .env with your Telegram bot token and chat ID
+npm run build
+npm start
+```
+
+Then configure your agent to submit requests to `http://YOUR_HOST_IP:3737/execute`
+
+### For Users (Agent Integration)
+
+See [DEPLOYMENT.md](./DEPLOYMENT.md) for agent-side setup instructions.
 
 **TL;DR:**
 1. Create a Telegram bot via @BotFather

@@ -64,6 +64,7 @@ export class TelegramApprovalBot {
         const [action, requestId, level] = data.split(':');
 
         if (action === 'approve') {
+          console.log(`👆 [${new Date().toISOString()}] Approval button clicked for ${requestId}`);
           const approvalLevel = (level as 'once' | '24h' | 'forever') || 'once';
           this.onApproval(requestId, approvalLevel);
           
@@ -123,6 +124,8 @@ export class TelegramApprovalBot {
     },
     codeHash: string
   ): Promise<number> {
+    console.log(`📤 [${new Date().toISOString()}] Sending Telegram approval request for ${requestId}`);
+    
     const message = `🔐 Execution Request
 
 Skill: ${skillId}
@@ -155,6 +158,7 @@ Hash: ${codeHash.substring(0, 16)}...`;
       disable_web_page_preview: false
     });
 
+    console.log(`✅ [${new Date().toISOString()}] Telegram message sent (message_id: ${sent.message_id})`);
     return sent.message_id;
   }
 
