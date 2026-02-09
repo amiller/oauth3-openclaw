@@ -31,10 +31,25 @@ export class TelegramApprovalBot {
 
   private async notifyAgent(message: string): Promise<void> {
     try {
-      // Write notification to file for agent to check via heartbeat
+      // Write to file (backup)
       const timestamp = new Date().toISOString();
       const notif = `${timestamp} ${message}\n`;
       await appendFile('/tmp/oauth3-notifications.log', notif);
+      
+      // Also try to POST to local notification endpoint (if available)
+      try {
+        const response = await fetch('http://127.0.0.1:18790/notify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message })
+        });
+        if (response.ok) {
+          console.log('✅ Agent notified immediately via HTTP');
+        }
+      } catch (httpError) {
+        // Notification endpoint not running, file-based fallback only
+      }
+      
       console.log('✅ Agent notification logged:', message);
     } catch (error) {
       console.error('Failed to notify agent:', error);
