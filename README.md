@@ -66,12 +66,13 @@ Key properties:
 ### ✅ Implemented
 
 - **Telegram approval workflow** with inline buttons
+- **Telegram secret management** - Add secrets via `/add_secret` command (see [TELEGRAM-COMMANDS.md](./TELEGRAM-COMMANDS.md))
 - **Docker sandbox execution** (Deno runtime by default)
 - **Network restrictions** (allow-list specific domains)
 - **Resource limits** (memory, CPU, timeout)
 - **Code hash verification** for trust levels
-- **SQLite storage** for secrets, approvals, and audit logs
-- **OpenClaw integration** via cron wake notifications
+- **SQLite storage** for approvals and audit logs
+- **OpenClaw integration** via notification system
 - **Skill metadata** (description, required secrets, network access)
 
 ### 🚧 Roadmap

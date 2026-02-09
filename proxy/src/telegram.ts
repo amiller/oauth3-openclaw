@@ -12,17 +12,20 @@ export class TelegramApprovalBot {
   private db: ProxyDatabase;
   private onApproval: (requestId: string, level: 'once' | '24h' | 'forever') => void;
   private onDenial: (requestId: string) => void;
+  private secretStore: Record<string, string>;
 
   constructor(
     token: string,
     chatId: string,
     db: ProxyDatabase,
+    secretStore: Record<string, string>,
     onApproval: (requestId: string, level: 'once' | '24h' | 'forever') => void,
     onDenial: (requestId: string) => void
   ) {
     this.bot = new TelegramBot(token, { polling: true });
     this.chatId = chatId;
     this.db = db;
+    this.secretStore = secretStore;
     this.onApproval = onApproval;
     this.onDenial = onDenial;
 
@@ -99,15 +102,24 @@ export class TelegramApprovalBot {
       }
     });
 
-    // Handle text messages (for getting chat ID)
-    this.bot.on('message', (msg) => {
-      console.log(`📨 Message from ${msg.from?.username || 'unknown'} (ID: ${msg.chat.id}): ${msg.text}`);
+    // Handle text messages
+    this.bot.on('message', async (msg) => {
+      console.log(`📨 Message from ${msg.from?.username || 'unknown'} (ID: ${msg.chat.id}): ${msg.text?.substring(0, 50)}...`);
+      
+      // Only respond to messages from the configured chat
+      if (msg.chat.id.toString() !== this.chatId) {
+        return;
+      }
       
       if (msg.text === '/start' || msg.text === '/id') {
-        this.bot.sendMessage(
+        await this.bot.sendMessage(
           msg.chat.id,
           `Your chat ID: ${msg.chat.id}\n\nBot is ready to receive execution requests.`
         );
+      } else if (msg.text?.startsWith('/add_secret ')) {
+        await this.handleAddSecret(msg);
+      } else if (msg.text === '/list_secrets') {
+        await this.handleListSecrets(msg);
       }
     });
   }
@@ -191,6 +203,68 @@ Hash: ${codeHash.substring(0, 16)}...`;
       });
     } catch (error) {
       console.error('Failed to update message:', error);
+    }
+  }
+
+  private async handleAddSecret(msg: TelegramBot.Message): Promise<void> {
+    try {
+      const text = msg.text || '';
+      const parts = text.split(' ');
+      
+      if (parts.length < 3) {
+        await this.bot.sendMessage(
+          msg.chat.id,
+          '❌ Usage: /add_secret SECRET_NAME secret_value\n\nExample:\n/add_secret OPENAI_API_KEY sk-...'
+        );
+        return;
+      }
+      
+      const secretName = parts[1];
+      const secretValue = parts.slice(2).join(' ');
+      
+      // Store the secret
+      this.secretStore[secretName] = secretValue;
+      
+      // Delete the user's message immediately (security!)
+      try {
+        await this.bot.deleteMessage(msg.chat.id, msg.message_id);
+      } catch (deleteError) {
+        console.warn('Could not delete message:', deleteError);
+      }
+      
+      // Send confirmation (without showing the secret)
+      await this.bot.sendMessage(
+        msg.chat.id,
+        `✅ Secret added: ${secretName}\n\n⚠️ Note: Secrets are stored in memory and will be lost on restart.\nFor production, use encrypted persistent storage.`
+      );
+      
+      console.log(`🔐 Secret added via Telegram: ${secretName} (length: ${secretValue.length})`);
+    } catch (error) {
+      console.error('Error adding secret:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ Failed to add secret');
+    }
+  }
+
+  private async handleListSecrets(msg: TelegramBot.Message): Promise<void> {
+    try {
+      const secretNames = Object.keys(this.secretStore);
+      
+      if (secretNames.length === 0) {
+        await this.bot.sendMessage(
+          msg.chat.id,
+          '📋 No secrets stored.\n\nAdd one with:\n/add_secret SECRET_NAME secret_value'
+        );
+        return;
+      }
+      
+      const list = secretNames.map(name => `• ${name}`).join('\n');
+      await this.bot.sendMessage(
+        msg.chat.id,
+        `📋 Stored secrets (${secretNames.length}):\n\n${list}\n\n⚠️ In-memory only (lost on restart)`
+      );
+    } catch (error) {
+      console.error('Error listing secrets:', error);
+      await this.bot.sendMessage(msg.chat.id, '❌ Failed to list secrets');
     }
   }
 

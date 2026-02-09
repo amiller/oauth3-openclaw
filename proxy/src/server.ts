@@ -22,6 +22,13 @@ const db = new ProxyDatabase(DB_PATH);
 
 import { TelegramApprovalBot } from './telegram.js';
 
+interface SecretStore {
+  [key: string]: string;
+}
+
+// In-memory secret store (will be replaced with encrypted storage)
+const secrets: SecretStore = {};
+
 // Telegram bot
 let telegramBot: TelegramApprovalBot | null = null;
 
@@ -30,6 +37,7 @@ if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
     db,
+    secrets,
     // On approval
     async (requestId, level) => {
       const request = db.getRequest(requestId);
@@ -59,13 +67,6 @@ if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
   
   console.log('✅ Telegram bot initialized');
 }
-
-interface SecretStore {
-  [key: string]: string;
-}
-
-// In-memory secret store (will be replaced with encrypted storage)
-const secrets: SecretStore = {};
 
 // Health check
 app.get('/health', (req: Request, res: Response) => {
