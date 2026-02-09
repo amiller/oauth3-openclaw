@@ -1,0 +1,274 @@
+/**
+ * HTTP API Server for Execution Proxy
+ */
+
+import express, { Request, Response } from 'express';
+import { ProxyDatabase } from './database.js';
+import { executeSkill, hashCode, parseMetadata } from './executor.js';
+import { randomBytes } from 'crypto';
+
+const app = express();
+app.use(express.json());
+
+// Config from environment
+const PORT = parseInt(process.env.PORT || '3737');
+const DB_PATH = process.env.DB_PATH || './proxy.db';
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+
+// Initialize database
+const db = new ProxyDatabase(DB_PATH);
+
+import { TelegramApprovalBot } from './telegram.js';
+
+// Telegram bot
+let telegramBot: TelegramApprovalBot | null = null;
+
+if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
+  telegramBot = new TelegramApprovalBot(
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
+    db,
+    // On approval
+    async (requestId, level) => {
+      const request = db.getRequest(requestId);
+      if (!request) return;
+
+      // Add to approvals if 24h or forever
+      if (level !== 'once') {
+        db.addApproval(request.skill_url, request.code_hash, level);
+      }
+
+      // Approve and execute
+      db.updateRequestStatus(requestId, 'approved');
+      
+      // Fetch code and execute
+      const codeResponse = await fetch(request.skill_url);
+      const code = await codeResponse.text();
+      const metadata = parseMetadata(code);
+      const requiredSecrets = JSON.parse(request.secrets);
+      
+      executeInBackground(requestId, code, metadata!, requiredSecrets);
+    },
+    // On denial
+    (requestId) => {
+      db.updateRequestStatus(requestId, 'denied');
+    }
+  );
+  
+  console.log('✅ Telegram bot initialized');
+}
+
+interface SecretStore {
+  [key: string]: string;
+}
+
+// In-memory secret store (will be replaced with encrypted storage)
+const secrets: SecretStore = {};
+
+// Health check
+app.get('/health', (req: Request, res: Response) => {
+  res.json({ 
+    status: 'ok',
+    telegram_configured: !!TELEGRAM_BOT_TOKEN,
+    timestamp: Date.now()
+  });
+});
+
+// Add secret (admin only - will add auth later)
+app.post('/secrets', (req: Request, res: Response) => {
+  const { name, value } = req.body;
+  
+  if (!name || !value) {
+    return res.status(400).json({ error: 'Missing name or value' });
+  }
+
+  secrets[name] = value;
+  res.json({ success: true, name });
+});
+
+// List secrets (names only)
+app.get('/secrets', (req: Request, res: Response) => {
+  res.json({ secrets: Object.keys(secrets) });
+});
+
+// Request execution
+app.post('/execute', async (req: Request, res: Response) => {
+  try {
+    const { skill_id, skill_url, secrets: requiredSecrets, args } = req.body;
+
+    if (!skill_id || !skill_url) {
+      return res.status(400).json({ error: 'Missing skill_id or skill_url' });
+    }
+
+    // Fetch skill code from URL
+    const codeResponse = await fetch(skill_url);
+    if (!codeResponse.ok) {
+      return res.status(400).json({ error: 'Failed to fetch skill code' });
+    }
+
+    const code = await codeResponse.text();
+    const codeHash = hashCode(code);
+
+    // Parse metadata
+    const metadata = parseMetadata(code);
+    if (!metadata) {
+      return res.status(400).json({ error: 'Invalid skill format - missing metadata' });
+    }
+
+    // Generate request ID
+    const requestId = `exec_${randomBytes(8).toString('hex')}`;
+
+    // Create request record
+    db.createRequest(requestId, skill_id, skill_url, codeHash, requiredSecrets || [], args);
+
+    // Check if already approved
+    const approval = db.getApproval(skill_url, codeHash);
+    
+    if (approval) {
+      // Auto-approve
+      db.updateRequestStatus(requestId, 'approved');
+      
+      // Execute immediately
+      executeInBackground(requestId, code, metadata, requiredSecrets || []);
+      
+      return res.json({
+        request_id: requestId,
+        status: 'approved',
+        message: 'Executing (pre-approved skill)'
+      });
+    }
+
+    // Send Telegram approval request
+    if (telegramBot) {
+      const messageId = await telegramBot.sendApprovalRequest(
+        requestId,
+        skill_id,
+        skill_url,
+        metadata,
+        codeHash
+      );
+      db.updateRequestStatus(requestId, 'pending', messageId);
+    } else {
+      console.warn('Telegram not configured - approval request cannot be sent');
+    }
+
+    res.json({
+      request_id: requestId,
+      status: 'pending',
+      message: 'Awaiting approval'
+    });
+
+  } catch (error: any) {
+    console.error('Execute error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get execution status
+app.get('/execute/:id/status', (req: Request, res: Response) => {
+  const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
+  const request = db.getRequest(id);
+  
+  if (!request) {
+    return res.status(404).json({ error: 'Request not found' });
+  }
+
+  const response: any = {
+    request_id: request.id,
+    status: request.status,
+    created_at: request.created_at
+  };
+
+  if (request.approved_at) response.approved_at = request.approved_at;
+  if (request.executed_at) response.executed_at = request.executed_at;
+  if (request.result) response.result = JSON.parse(request.result);
+  if (request.error) response.error = request.error;
+
+  res.json(response);
+});
+
+// Helper: Format approval message
+function formatApprovalMessage(skillId: string, skillUrl: string, metadata: any): string {
+  return `🔐 Execution Request
+
+Skill: ${skillId}
+Secrets: ${metadata.secrets.join(', ')}
+Network: ${metadata.network.join(', ')}
+
+📄 View Code
+${skillUrl}
+
+Description: ${metadata.description}`;
+}
+
+// Helper: Execute skill in background
+async function executeInBackground(
+  requestId: string,
+  code: string,
+  metadata: any,
+  requiredSecrets: string[]
+) {
+  try {
+    db.updateRequestStatus(requestId, 'executing');
+
+    // Build secrets object
+    const secretValues: Record<string, string> = {};
+    for (const secretName of requiredSecrets) {
+      if (!secrets[secretName]) {
+        throw new Error(`Missing secret: ${secretName}`);
+      }
+      secretValues[secretName] = secrets[secretName];
+    }
+
+    // Execute
+    const result = await executeSkill({
+      code,
+      secrets: secretValues,
+      timeout: metadata.timeout || 30,
+      allowedNetworks: metadata.network || []
+    });
+
+    // Store result
+    db.updateRequestResult(requestId, {
+      success: result.success,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: result.exitCode,
+      duration: result.duration
+    }, result.success ? undefined : result.stderr);
+
+    // Update Telegram message
+    const request = db.getRequest(requestId);
+    if (request?.telegram_message_id && telegramBot) {
+      await telegramBot.updateExecution(request.telegram_message_id, requestId, {
+        success: result.success,
+        stdout: result.stdout,
+        error: result.stderr,
+        duration: result.duration
+      });
+    }
+
+  } catch (error: any) {
+    db.updateRequestResult(requestId, null, error.message);
+  }
+}
+
+// Cleanup expired approvals periodically
+setInterval(() => {
+  db.cleanupExpired();
+}, 60 * 60 * 1000); // Every hour
+
+// Start server
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ Execution Proxy running on port ${PORT}`);
+  console.log(`📊 Database: ${DB_PATH}`);
+  console.log(`🤖 Telegram: ${TELEGRAM_BOT_TOKEN ? 'Configured' : 'Not configured'}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('Shutting down...');
+  db.close();
+  process.exit(0);
+});

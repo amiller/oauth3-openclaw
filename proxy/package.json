@@ -1,0 +1,29 @@
+{
+  "name": "execution-proxy",
+  "version": "1.0.0",
+  "description": "Execution proxy with Telegram approval",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts",
+    "test": "tsx src/test.ts"
+  },
+  "keywords": [],
+  "author": "clawTEEdah",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^12.6.2",
+    "express": "^5.2.1",
+    "node-telegram-bot-api": "^0.67.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.2.2",
+    "@types/node-telegram-bot-api": "^0.64.13",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
