@@ -77,13 +77,21 @@ Key properties:
 
 ### 🚧 Roadmap
 
-- **CLI tool** for secret management (`oauth3 secret add OPENAI_API_KEY`)
-- **Skill registry** with hash-based verification
-- **GitHub Gist integration** for skill documentation hosting
-- **Multi-runtime support** (Deno, Node, Python, QuickJS)
-- **BotMaker pattern** for LLM API proxying (header rewriting)
-- **Web UI** for approval management and audit logs
-- **Nested VM option** for even stronger isolation
+**🔐 Coming Soon: Hosted TEE Service** - No setup required!
+
+Instead of deploying your own:
+- Message **@OAuth3Bot** (shared public bot)
+- Runs in **Intel TDX TEE** with attestation
+- **Provably secure** - verify code before trusting
+- Pay-as-you-go pricing
+- Lower barrier to entry while maintaining security
+
+See **[ROADMAP.md](./ROADMAP.md)** for full details on the TEE-hosted service and other planned features:
+- Persistent encrypted secret storage
+- Web dashboard + mobile app  
+- Public skill marketplace
+- Multi-runtime support (Python, Node, QuickJS)
+- Enhanced security (2FA, anomaly detection)
 
 ## Quick Start
 
