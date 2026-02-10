@@ -13,7 +13,6 @@ export class TelegramApprovalBot {
   private onApproval: (requestId: string, level: 'once' | '24h' | 'forever') => void;
   private onDenial: (requestId: string) => void;
   private secretStore: Record<string, string>;
-  private pendingSecretRequests: Map<string, { requestId: string; secretName: string }>;
 
   constructor(
     token: string,
@@ -29,7 +28,6 @@ export class TelegramApprovalBot {
     this.secretStore = secretStore;
     this.onApproval = onApproval;
     this.onDenial = onDenial;
-    this.pendingSecretRequests = new Map();
 
     this.setupHandlers();
   }
@@ -110,12 +108,6 @@ export class TelegramApprovalBot {
       
       // Only respond to messages from the configured chat
       if (msg.chat.id.toString() !== this.chatId) {
-        return;
-      }
-      
-      // Check if this is a reply to a secret request
-      if (msg.reply_to_message) {
-        await this.handleSecretReply(msg);
         return;
       }
       
@@ -243,7 +235,7 @@ Hash: ${codeHash.substring(0, 16)}...`;
       // Send confirmation (without showing the secret)
       await this.bot.sendMessage(
         msg.chat.id,
-        `✅ Secret added: ${secretName}\n\n⚠️ Note: Secrets are stored in memory and will be lost on restart.\nFor production, use encrypted persistent storage.`
+        `✅ Secret added: ${secretName}\n\nYou can now submit execution requests that need this secret.\n\n⚠️ Note: Secrets are stored in memory and will be lost on restart.`
       );
       
       console.log(`🔐 Secret added via Telegram: ${secretName} (length: ${secretValue.length})`);
@@ -276,92 +268,20 @@ Hash: ${codeHash.substring(0, 16)}...`;
     }
   }
 
-  private async handleSecretReply(msg: TelegramBot.Message): Promise<void> {
-    try {
-      const replyToId = msg.reply_to_message?.message_id;
-      if (!replyToId) return;
-      
-      const requestKey = replyToId.toString();
-      const pending = this.pendingSecretRequests.get(requestKey);
-      
-      if (!pending) {
-        // Not a reply to a secret request
-        return;
-      }
-      
-      const secretValue = msg.text || '';
-      if (!secretValue) {
-        await this.bot.sendMessage(msg.chat.id, '❌ Secret value cannot be empty');
-        return;
-      }
-      
-      // Store the secret
-      this.secretStore[pending.secretName] = secretValue;
-      this.pendingSecretRequests.delete(requestKey);
-      
-      // Disable auto-delete now that secret is received
-      try {
-        const token = (this.bot as any).token;
-        await fetch(`https://api.telegram.org/bot${token}/setChatMessageAutoDeleteTime`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: msg.chat.id,
-            message_auto_delete_time: 0
-          })
-        });
-        console.log('🔓 Disabled disappearing messages');
-      } catch (disableError) {
-        console.warn('Could not disable auto-delete:', disableError);
-      }
-      
-      // Confirm and retry execution
-      await this.bot.sendMessage(
-        msg.chat.id,
-        `✅ Secret received: ${pending.secretName}\n\n🔄 Retrying execution for request ${pending.requestId}...`
-      );
-      
-      console.log(`🔐 Secret provided via reply: ${pending.secretName} (length: ${secretValue.length})`);
-      
-      // Trigger retry - call the approval callback again
-      this.onApproval(pending.requestId, 'once');
-      
-    } catch (error) {
-      console.error('Error handling secret reply:', error);
-      await this.bot.sendMessage(msg.chat.id, '❌ Failed to process secret');
-    }
-  }
-
   async requestSecret(requestId: string, secretName: string): Promise<void> {
     try {
-      // Enable auto-delete for 60 seconds via direct API call
-      const token = (this.bot as any).token;
-      await fetch(`https://api.telegram.org/bot${token}/setChatMessageAutoDeleteTime`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: this.chatId,
-          message_auto_delete_time: 60
-        })
-      });
-      console.log('🔒 Enabled disappearing messages (60s)');
-      
       const message = `🔑 Missing Secret Required
 
 Request: ${requestId}
 Secret: ${secretName}
 
-Please reply to this message with the value for ${secretName}.
+To add this secret, use:
 
-⏱️ Messages will auto-delete in 60 seconds.`;
+/add_secret ${secretName} your-secret-value-here
 
-      const sent = await this.bot.sendMessage(this.chatId, message);
-      
-      // Track this request
-      this.pendingSecretRequests.set(sent.message_id.toString(), {
-        requestId,
-        secretName
-      });
+After adding the secret, the execution will automatically retry.`;
+
+      await this.bot.sendMessage(this.chatId, message);
       
       console.log(`📨 Requested secret ${secretName} for ${requestId}`);
     } catch (error) {
