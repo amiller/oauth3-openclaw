@@ -3,7 +3,11 @@
 /**
  * Fruit Classifier - Uses Anthropic API to classify fruits
  * 
- * Requires: ANTHROPIC_API_KEY environment variable
+ * @skill fruit-classifier
+ * @description Classifies fruits using Claude API (apple, dragonfruit, durian)
+ * @secrets ANTHROPIC_API_KEY
+ * @network api.anthropic.com
+ * @timeout 60
  */
 
 interface Message {
