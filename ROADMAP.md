@@ -95,13 +95,31 @@
 - Browser extension for one-click approval
 - Slack/Discord integration
 
-### 🏗️ Skill Registry (v0.3)
+### 🏗️ Verified Skills Program (v0.3)
 
-- Public skill marketplace
-- Hash-based verification
-- Automatic trust for verified publishers
-- Skill versioning
-- Dependency management
+**Problem:** Users can't audit code themselves.
+
+**Solution 1: "Discuss with Claude" links**
+- Add to every Gist/skill page
+- Pre-load code into Claude chat
+- Users ask: "Is this safe? What does it do?"
+- AI-assisted code review for non-technical users
+
+**Solution 2: Verified Skills Repository**
+- `oauth3-verified-skills` - curated, security-reviewed scripts
+- Hash-based trust tracking
+- Bot shows "✅ Verified by OAuth3 Team" badge
+- Users trust the script, approve the USE
+- Security reviews by experts
+- Community contribution model
+
+**Implementation:**
+- Repository: https://github.com/oauth3/verified-skills (TBD)
+- API: `GET /api/v1/skills/{hash}` returns verification metadata
+- Bot checks hash on every execution
+- Annual re-reviews for security
+
+See [USER-JOURNEY.md](./docs/USER-JOURNEY.md) for full details.
 
 ## Contributing
 
