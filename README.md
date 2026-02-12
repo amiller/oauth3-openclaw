@@ -4,9 +4,15 @@
 
 OAuth3-OpenClaw provides a secure execution proxy that enables AI agents to request access to secrets (API keys, tokens, credentials) with explicit human approval via Telegram. The agent submits code for execution, you review and approve via inline buttons, and the proxy runs the code in an isolated Docker sandbox with time-limited secret access.
 
-🔗 **GitHub:** https://github.com/claw-tee-dah/oauth3-openclaw  
-📋 **Status:** ✅ Fully functional (see [TESTING-RESULTS.md](./TESTING-RESULTS.md))  
+🔗 **GitHub:** https://github.com/claw-tee-dah/oauth3-openclaw
+📋 **Status:** ✅ Fully functional (see [TESTING-RESULTS.md](./TESTING-RESULTS.md))
 📖 **Host Setup:** See [DEPLOYMENT.md](./DEPLOYMENT.md) for step-by-step instructions
+
+<p align="center">
+  <img src="images/skill-code-gist.jpeg" width="520" alt="Skill code hosted on GitHub Gist — a constrained Claude query using Deno">
+  <img src="images/telegram-approval.jpeg" width="300" alt="Telegram approval flow with Run Once, Deny, and Trust Code buttons">
+</p>
+<p align="center"><em>Left: Agent skill code on a GitHub Gist. Right: Human approval via Telegram with one-tap Run Once / Deny / Trust Code.</em></p>
 
 ## Why OAuth3?
 
@@ -18,6 +24,20 @@ Key properties:
 - **Trust levels**: Approve once, trust for 24h, or always trust based on code hash
 - **Auditable**: All requests and approvals logged to SQLite
 - **Agent notifications**: Automatic cron wake events notify your agent of approval/denial
+
+## Agent-First Workflow
+
+**The agent initiates, the human approves.** This is the core pattern:
+
+1. **Agent decides it needs to execute code** requiring secrets (API keys, tokens, credentials)
+2. **Agent calls `/execute` endpoint** with code URL, parameters, and required secrets list
+3. **Proxy sends approval request to Telegram** with inline buttons
+4. **If secrets are missing**: Bot prompts human to add them (with auto-deleting messages for security)
+5. **Human reviews and approves** (Run Once / Trust 24h / Always Trust / Deny)
+6. **Proxy executes in Docker sandbox** with secrets injected as environment variables
+7. **Proxy sends result back** to agent and notifies via cron wake event
+
+**Key point**: The agent doesn't ask "do you have an API key?" or "can I use this?" — it just attempts the operation. The proxy handles the human approval flow automatically.
 
 ## Architecture
 
@@ -92,6 +112,19 @@ See **[ROADMAP.md](./ROADMAP.md)** for full details on the TEE-hosted service an
 - Public skill marketplace
 - Multi-runtime support (Python, Node, QuickJS)
 - Enhanced security (2FA, anomaly detection)
+
+## dstack / Phala Cloud Deployment
+
+Run oauth3-proxy as a **sidecar** alongside OpenClaw in a Phala Cloud CVM (dstack TEE). The agent reaches the proxy at `http://oauth3-proxy:3737` on the compose network. In TEE mode, Deno skills execute directly — no Docker needed, the TEE is the sandbox.
+
+```
+┌─ Phala CVM ────────────────────────────────┐
+│  openclaw ──POST──→ oauth3-proxy:3737      │
+│  (agent)            (approval + execution)  │
+└─────────────────────────────────────────────┘
+```
+
+**→ See [dstack/README.md](./dstack/README.md) for the full integration guide.**
 
 ## Quick Start
 
@@ -218,6 +251,12 @@ oauth3-openclaw/
 │   ├── dist/                # Compiled JavaScript (generated)
 │   ├── package.json
 │   └── tsconfig.json
+├── dstack/                  # Phala CVM sidecar integration
+│   ├── docker-compose-sidecar.yaml
+│   └── README.md
+├── images/                  # Screenshots
+│   ├── skill-code-gist.jpeg
+│   └── telegram-approval.jpeg
 ├── docs/
 │   ├── PLAN.md              # Original design document
 │   ├── TESTING.md           # Test strategy

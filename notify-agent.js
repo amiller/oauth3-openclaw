@@ -16,6 +16,15 @@ const server = http.createServer(async (req, res) => {
     let body = '';
     
     req.on('data', chunk => { body += chunk; });
+    
+    req.on('error', (error) => {
+      console.error('❌ Request error:', error);
+      try {
+        res.writeHead(500);
+        res.end();
+      } catch (e) {}
+    });
+    
     req.on('end', async () => {
       try {
         const { message } = JSON.parse(body);
@@ -25,10 +34,19 @@ const server = http.createServer(async (req, res) => {
         const timestamp = new Date().toISOString();
         require('fs').appendFileSync('/tmp/oauth3-notifications.log', `${timestamp} ${message}\n`);
         
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, message: 'Notification logged - check file manually for now' }));
-        
-        console.log(`✅ Notification written to /tmp/oauth3-notifications.log`);
+        // Trigger immediate system event to main session
+        try {
+          const escapedMessage = message.replace(/"/g, '\\"').replace(/\n/g, '\\n');
+          const { stdout } = await execAsync(`openclaw system event --text "${escapedMessage}" --mode now`);
+          console.log(`✅ System event triggered: ${message}`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, message: 'Notification sent via system event' }));
+        } catch (wakeError) {
+          console.error(`⚠️ System event failed:`, wakeError.message);
+          console.error(`  Full error:`, wakeError.stderr || wakeError.stdout);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, message: 'Notification logged to file (system event failed)' }));
+        }
       } catch (error) {
         console.error('Error:', error);
         res.writeHead(400);
@@ -47,4 +65,15 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`🔔 Notification receiver listening on http://127.0.0.1:${PORT}`);
   console.log(`📁 Writing notifications to /tmp/oauth3-notifications.log`);
+});
+
+// Prevent crashes
+process.on('uncaughtException', (error) => {
+  console.error('❌ Uncaught exception:', error);
+  console.log('  Process continuing...');
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Unhandled rejection:', reason);
+  console.log('  Process continuing...');
 });

@@ -1,0 +1,57 @@
+# oauth3-proxy sidecar for OpenClaw Phala CVM deployment
+# Add to your existing phala-deploy/docker-compose.yml
+#
+# The openclaw service below is a placeholder — use your actual image digest.
+# The oauth3-proxy service can be copied as-is.
+
+services:
+  openclaw:
+    image: h4x3rotab/openclaw-cvm@sha256:REPLACE_WITH_CURRENT_DIGEST
+    container_name: openclaw
+    privileged: true
+    ports:
+      - "1022:22"
+      - "18789:18789"
+    volumes:
+      - /home/root/.ssh:/root/.ssh:ro
+      - openclaw_data:/data
+      - docker_data:/var/lib/docker
+    environment:
+      NODE_ENV: production
+      MASTER_KEY: ${MASTER_KEY:-}
+      REDPILL_API_KEY: ${REDPILL_API_KEY:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_PREFIX: ${S3_PREFIX:-openclaw-data}
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_PROVIDER: ${S3_PROVIDER:-Other}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    restart: unless-stopped
+    networks:
+      - internal
+
+  oauth3-proxy:
+    image: ghcr.io/amiller/oauth3-proxy:latest
+    container_name: oauth3-proxy
+    # No external ports — only openclaw talks to it
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      PORT: "3737"
+      DB_PATH: /data/proxy.db
+      EXECUTOR_MODE: direct
+    volumes:
+      - oauth3_data:/data
+    restart: unless-stopped
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  openclaw_data:
+  docker_data:
+  oauth3_data:

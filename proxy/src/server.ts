@@ -5,7 +5,7 @@
 import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import { ProxyDatabase } from './database.js';
-import { executeSkill, hashCode, parseMetadata } from './executor.js';
+import { executeSkill, hashCode, parseMetadata, EXECUTOR_MODE } from './executor.js';
 import { randomBytes } from 'crypto';
 
 const app = express();
@@ -43,9 +43,12 @@ if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
       const request = db.getRequest(requestId);
       if (!request) return;
 
-      // Add to approvals if 24h or forever
-      if (level !== 'once') {
+      // Add to approvals if 24h or forever or trust_code
+      if (level === '24h' || level === 'forever') {
         db.addApproval(request.skill_url, request.code_hash, level);
+      } else if (level === 'trust_code') {
+        // trust_code means trust the code permanently (already handled in telegram.ts)
+        // No need to add again here
       }
 
       // Approve and execute
@@ -121,26 +124,16 @@ app.post('/execute', async (req: Request, res: Response) => {
     // Generate request ID
     const requestId = `exec_${randomBytes(8).toString('hex')}`;
 
+    // Normalize secrets to string[] (accept array or object)
+    const secretsList = Array.isArray(requiredSecrets) ? requiredSecrets
+      : requiredSecrets && typeof requiredSecrets === 'object' ? Object.keys(requiredSecrets) : [];
+
     // Create request record
-    db.createRequest(requestId, skill_id, skill_url, codeHash, requiredSecrets || [], args);
+    db.createRequest(requestId, skill_id, skill_url, codeHash, secretsList, args);
 
-    // Check if already approved
-    const approval = db.getApproval(skill_url, codeHash);
+    // Always send approval request (Option A: separate code trust from invocation approval)
+    // Even if code is trusted, human still approves each invocation
     
-    if (approval) {
-      // Auto-approve
-      db.updateRequestStatus(requestId, 'approved');
-      
-      // Execute immediately
-      executeInBackground(requestId, code, metadata, requiredSecrets || []);
-      
-      return res.json({
-        request_id: requestId,
-        status: 'approved',
-        message: 'Executing (pre-approved skill)'
-      });
-    }
-
     // Send Telegram approval request
     if (telegramBot) {
       const messageId = await telegramBot.sendApprovalRequest(
@@ -148,7 +141,8 @@ app.post('/execute', async (req: Request, res: Response) => {
         skill_id,
         skill_url,
         metadata,
-        codeHash
+        codeHash,
+        args
       );
       db.updateRequestStatus(requestId, 'pending', messageId);
     } else {
@@ -219,6 +213,10 @@ async function executeInBackground(
     db.updateRequestStatus(requestId, 'executing');
     console.log(`  Status updated to 'executing'`);
 
+    // Get request from database to retrieve args
+    const dbRequest = db.getRequest(requestId);
+    const args = dbRequest?.args ? JSON.parse(dbRequest.args) : {};
+
     // Build secrets object
     const secretValues: Record<string, string> = {};
     const missingSecrets: string[] = [];
@@ -252,6 +250,7 @@ async function executeInBackground(
     const result = await executeSkill({
       code,
       secrets: secretValues,
+      args,
       timeout: metadata.timeout || 30,
       allowedNetworks: metadata.network || []
     });
@@ -269,18 +268,41 @@ async function executeInBackground(
     // Update Telegram message
     const request = db.getRequest(requestId);
     if (request?.telegram_message_id && telegramBot) {
-      await telegramBot.updateExecution(request.telegram_message_id, requestId, {
-        success: result.success,
-        stdout: result.stdout,
-        error: result.stderr,
-        duration: result.duration
-      });
+      try {
+        console.log(`  Updating Telegram message ${request.telegram_message_id}...`);
+        await telegramBot.updateExecution(request.telegram_message_id, requestId, {
+          success: result.success,
+          stdout: result.stdout,
+          error: result.stderr,
+          duration: result.duration
+        });
+        console.log(`  ✅ Telegram message updated`);
+      } catch (updateError: any) {
+        console.error(`  ⚠️ Failed to update Telegram message:`, updateError.message);
+      }
+    } else {
+      console.log(`  ⚠️ No Telegram message to update (message_id: ${request?.telegram_message_id})`);
     }
 
   } catch (error: any) {
     console.error(`❌ Execution failed for ${requestId}:`, error.message);
     console.error(`  Stack:`, error.stack);
     db.updateRequestResult(requestId, null, error.message);
+    
+    // Try to update Telegram even on crash
+    try {
+      const request = db.getRequest(requestId);
+      if (request?.telegram_message_id && telegramBot) {
+        await telegramBot.updateExecution(request.telegram_message_id, requestId, {
+          success: false,
+          stdout: '',
+          error: error.message,
+          duration: 0
+        });
+      }
+    } catch (updateError) {
+      console.error(`  Failed to notify user of crash:`, updateError);
+    }
   }
 }
 
@@ -293,6 +315,7 @@ setInterval(() => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Execution Proxy running on port ${PORT}`);
   console.log(`📊 Database: ${DB_PATH}`);
+  console.log(`⚙️  Executor: ${EXECUTOR_MODE} mode`);
   console.log(`🤖 Telegram: ${TELEGRAM_BOT_TOKEN ? 'Configured' : 'Not configured'}`);
 });
 
