@@ -45,6 +45,7 @@ export class ProxyDatabase {
         skill_id TEXT NOT NULL,
         skill_url TEXT NOT NULL,
         code_hash TEXT NOT NULL,
+        code TEXT,
         secrets TEXT NOT NULL,
         args TEXT,
         status TEXT NOT NULL,
@@ -65,10 +66,19 @@ export class ProxyDatabase {
         PRIMARY KEY (skill_url, code_hash)
       );
 
+      CREATE TABLE IF NOT EXISTS secrets (
+        name TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_requests_status ON execution_requests(status);
       CREATE INDEX IF NOT EXISTS idx_requests_created ON execution_requests(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_approvals_expires ON skill_approvals(expires_at);
     `);
+    // Migrate: add code column if missing
+    try { this.db.exec('ALTER TABLE execution_requests ADD COLUMN code TEXT'); } catch {}
   }
 
   // Execution Requests
@@ -179,6 +189,38 @@ export class ProxyDatabase {
     this.db.prepare(`
       DELETE FROM skill_approvals WHERE expires_at IS NOT NULL AND expires_at < ?
     `).run(Date.now());
+  }
+
+  // Secrets (persisted)
+
+  setSecret(name: string, value: string): void {
+    const now = Date.now();
+    this.db.prepare(`
+      INSERT INTO secrets (name, value, created_at, updated_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(name) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `).run(name, value, now, now);
+  }
+
+  getAllSecrets(): Record<string, string> {
+    const rows = this.db.prepare('SELECT name, value FROM secrets').all() as { name: string; value: string }[];
+    const out: Record<string, string> = {};
+    for (const r of rows) out[r.name] = r.value;
+    return out;
+  }
+
+  deleteSecret(name: string): void {
+    this.db.prepare('DELETE FROM secrets WHERE name = ?').run(name);
+  }
+
+  // Code storage
+
+  storeCode(requestId: string, code: string): void {
+    this.db.prepare('UPDATE execution_requests SET code = ? WHERE id = ?').run(code, requestId);
+  }
+
+  getCode(requestId: string): string | null {
+    const row = this.db.prepare('SELECT code FROM execution_requests WHERE id = ?').get(requestId) as { code: string | null } | undefined;
+    return row?.code ?? null;
   }
 
   close(): void {

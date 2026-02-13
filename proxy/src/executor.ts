@@ -91,6 +91,12 @@ function buildDenoPermArgs(request: ExecutionRequest): { denoArgs: string[], arg
   const networks = request.allowedNetworks || [];
   const denoArgs = ['run', '--no-prompt', '--quiet'];
 
+  // In direct mode the TEE is the sandbox — grant all permissions
+  if (EXECUTOR_MODE === 'direct') {
+    denoArgs.push('--allow-all');
+    return { denoArgs, argKeys: Object.keys(request.args || {}) };
+  }
+
   if (networks.length > 0) {
     denoArgs.push(`--allow-net=${networks.join(',')}`);
   }

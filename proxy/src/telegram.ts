@@ -22,6 +22,7 @@ export class TelegramApprovalBot {
   private secretStore: Record<string, string>;
   private pendingApprovals: Map<string, PendingApproval>;
   private requestMetadata: Map<string, string[]>; // requestId -> required secrets
+  private publicUrl: string;
 
   constructor(
     token: string,
@@ -29,7 +30,8 @@ export class TelegramApprovalBot {
     db: ProxyDatabase,
     secretStore: Record<string, string>,
     onApproval: (requestId: string, level: 'once' | '24h' | 'forever' | 'trust_code') => void,
-    onDenial: (requestId: string) => void
+    onDenial: (requestId: string) => void,
+    publicUrl: string = ''
   ) {
     this.bot = new TelegramBot(token, { polling: true });
     this.chatId = chatId;
@@ -39,6 +41,7 @@ export class TelegramApprovalBot {
     this.onDenial = onDenial;
     this.pendingApprovals = new Map();
     this.requestMetadata = new Map();
+    this.publicUrl = publicUrl;
 
     this.setupHandlers();
   }
@@ -228,9 +231,10 @@ export class TelegramApprovalBot {
           const secretName = match[1];
           const secretValue = msg.text;
           
-          // Store the secret
+          // Store the secret (memory + DB)
           this.secretStore[secretName] = secretValue;
-          
+          this.db.setSecret(secretName, secretValue);
+
           // Delete both messages immediately (security!)
           try {
             await this.bot.deleteMessage(msg.chat.id, msg.message_id);
@@ -238,7 +242,7 @@ export class TelegramApprovalBot {
           } catch (deleteError) {
             console.warn('Could not delete messages:', deleteError);
           }
-          
+
           console.log(`🔐 Secret added via reply: ${secretName} (length: ${secretValue.length})`);
           
           // Check if there are pending approvals waiting for this secret
@@ -357,14 +361,16 @@ export class TelegramApprovalBot {
       invocationDetails = `\n\n🎯 This Invocation:\n${argsList}`;
     }
     
-    // Create Claude discussion link
-    const claudePrompt = encodeURIComponent(`Review this OAuth3 execution request and help me decide if it's safe to approve:\n\nSkill: ${skillId}\nDescription: ${metadata.description}\nSecrets requested: ${metadata.secrets.join(', ')}\nNetwork access: ${metadata.network.join(', ')}\n\nCode: ${skillUrl}`);
-    const claudeLink = `https://claude.ai/new?q=${claudePrompt}`;
-    
     const escHtml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    // Prefer public /view/:id URL so Telegram users can actually see the code
+    const viewUrl = this.publicUrl ? `${this.publicUrl}/view/${requestId}` : skillUrl;
+
+    // Create Claude discussion link using the public view URL
+    const claudePrompt = encodeURIComponent(`Review this OAuth3 execution request and help me decide if it's safe to approve:\n\nSkill: ${skillId}\nDescription: ${metadata.description}\nSecrets requested: ${metadata.secrets.join(', ')}\nNetwork access: ${metadata.network.join(', ')}\n\nCode: ${viewUrl}`);
+    const claudeLink = `https://claude.ai/new?q=${claudePrompt}`;
     const codeLink = skillUrl.startsWith('data:')
       ? `📄 Code: <i>inline data URI</i>`
-      : `📄 <a href="${escHtml(skillUrl)}">View Code</a>`;
+      : `📄 <a href="${escHtml(viewUrl)}">View Code</a>`;
 
     const message = `🔐 Execution Request
 
@@ -485,20 +491,21 @@ Hash: ${codeHash.substring(0, 16)}...`;
       const secretName = parts[1];
       const secretValue = parts.slice(2).join(' ');
       
-      // Store the secret
+      // Store the secret (memory + DB)
       this.secretStore[secretName] = secretValue;
-      
+      this.db.setSecret(secretName, secretValue);
+
       // Delete the user's message immediately (security!)
       try {
         await this.bot.deleteMessage(msg.chat.id, msg.message_id);
       } catch (deleteError) {
         console.warn('Could not delete message:', deleteError);
       }
-      
+
       // Send confirmation (without showing the secret)
       await this.bot.sendMessage(
         msg.chat.id,
-        `✅ Secret added: ${secretName}\n\nYou can now submit execution requests that need this secret.\n\n⚠️ Note: Secrets are stored in memory and will be lost on restart.`
+        `✅ Secret added: ${secretName}\n\nPersisted to database — survives restarts.`
       );
       
       console.log(`🔐 Secret added via Telegram: ${secretName} (length: ${secretValue.length})`);
@@ -523,7 +530,7 @@ Hash: ${codeHash.substring(0, 16)}...`;
       const list = secretNames.map(name => `• ${name}`).join('\n');
       await this.bot.sendMessage(
         msg.chat.id,
-        `📋 Stored secrets (${secretNames.length}):\n\n${list}\n\n⚠️ In-memory only (lost on restart)`
+        `📋 Stored secrets (${secretNames.length}):\n\n${list}\n\n✅ Persisted to database`
       );
     } catch (error) {
       console.error('Error listing secrets:', error);
