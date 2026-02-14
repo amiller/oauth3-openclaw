@@ -13,6 +13,11 @@ interface PendingApproval {
   requiredSecrets: string[];
 }
 
+interface RequestMessage {
+  messageId: number;
+  baseText: string; // original message text (HTML)
+}
+
 export class TelegramApprovalBot {
   private bot: TelegramBot;
   private chatId: string;
@@ -22,6 +27,7 @@ export class TelegramApprovalBot {
   private secretStore: Record<string, string>;
   private pendingApprovals: Map<string, PendingApproval>;
   private requestMetadata: Map<string, string[]>; // requestId -> required secrets
+  private requestMessages: Map<string, RequestMessage>; // requestId -> original message info
   private publicUrl: string;
 
   constructor(
@@ -41,6 +47,7 @@ export class TelegramApprovalBot {
     this.onDenial = onDenial;
     this.pendingApprovals = new Map();
     this.requestMetadata = new Map();
+    this.requestMessages = new Map();
     this.publicUrl = publicUrl;
 
     this.setupHandlers();
@@ -120,8 +127,7 @@ export class TelegramApprovalBot {
         if (action === 'approve') {
           console.log(`👆 [${new Date().toISOString()}] Approval button clicked for ${requestId}`);
           const approvalLevel = (level as 'once' | 'trust_code' | '24h' | 'forever') || 'once';
-          
-          // If trust_code, mark code as trusted permanently
+
           if (approvalLevel === 'trust_code') {
             const request = this.db.getRequest(requestId);
             if (request) {
@@ -129,70 +135,36 @@ export class TelegramApprovalBot {
               console.log(`🔒 Code trusted: ${request.code_hash.substring(0, 16)}...`);
             }
           }
-          
-          // Mark original message as approved (keep it visible)
-          try {
-            await this.bot.editMessageReplyMarkup(
-              { inline_keyboard: [] }, // Remove buttons
-              {
-                chat_id: query.message!.chat.id,
-                message_id: query.message!.message_id
-              }
-            );
-          } catch (e) {
-            // Editing failed, that's okay
-          }
-          
+
+          const reqMsg = this.requestMessages.get(requestId);
+          const msgId = query.message!.message_id;
+          const chatId = query.message!.chat.id;
+
           // Check if any required secrets are missing
           const requiredSecrets = this.requestMetadata.get(requestId) || [];
           const missingSecrets = requiredSecrets.filter(name => !this.secretStore[name]);
-          
+
           if (missingSecrets.length > 0) {
-            // Send new message prompting for secret
             const secretName = missingSecrets[0];
-            const keyboard = {
-              inline_keyboard: [
-                [
-                  { text: `🔑 Add ${secretName}`, callback_data: `add_secret:${secretName}:${requestId}` }
-                ]
-              ]
-            };
-            
-            const sent = await this.bot.sendMessage(
-              query.message!.chat.id,
-              `✅ Approved (${approvalLevel})\n\n🔑 Secret Required: ${secretName}\n\nRequest: ${requestId}\n\nClick below to add it, then execution will proceed automatically.`,
-              {
-                reply_markup: keyboard
-              }
-            );
-            
-            // Store pending approval with the new message ID
+            // Edit original message to show approval + secret prompt
+            await this.editRequestMessage(requestId, `\n\n✅ Approved (${approvalLevel})\n🔑 Need secret: ${secretName}`, {
+              inline_keyboard: [[
+                { text: `🔑 Add ${secretName}`, callback_data: `add_secret:${secretName}:${requestId}` }
+              ]]
+            });
+
             this.pendingApprovals.set(requestId, {
-              requestId,
-              level: approvalLevel,
-              messageId: sent.message_id,
-              requiredSecrets: missingSecrets
+              requestId, level: approvalLevel, messageId: msgId, requiredSecrets: missingSecrets
             });
-            
-            await this.bot.answerCallbackQuery(query.id, {
-              text: `Approved - secret ${secretName} required`
-            });
+
+            await this.bot.answerCallbackQuery(query.id, { text: `Need secret: ${secretName}` });
             return;
           }
-          
-          // All secrets available - proceed with execution
+
+          // All secrets available - edit to show executing, then proceed
+          await this.editRequestMessage(requestId, `\n\n✅ Approved (${approvalLevel}) — executing...`);
           this.onApproval(requestId, approvalLevel);
-          
-          await this.bot.sendMessage(
-            query.message!.chat.id,
-            `✅ Approved (${approvalLevel})\n\nRequest: ${requestId}\nExecuting...`
-          );
-          
-          await this.bot.answerCallbackQuery(query.id, {
-            text: `Approved - executing`
-          });
-          
-          // Notify agent via cron wake
+          await this.bot.answerCallbackQuery(query.id, { text: `Executing` });
           await this.notifyAgent(`Execution approved (${approvalLevel}): ${requestId}`);
         } else if (action === 'deny') {
           this.onDenial(requestId);
@@ -248,66 +220,28 @@ export class TelegramApprovalBot {
           // Check if there are pending approvals waiting for this secret
           let executedAny = false;
           for (const [requestId, pending] of this.pendingApprovals.entries()) {
-            if (pending.requiredSecrets.includes(secretName)) {
-              // Remove buttons from the secret prompt message
-              try {
-                await this.bot.editMessageReplyMarkup(
-                  { inline_keyboard: [] },
-                  {
-                    chat_id: msg.chat.id,
-                    message_id: pending.messageId
-                  }
-                );
-              } catch (e) {
-                // Editing failed, that's okay
-              }
-              
-              // Check if all secrets are now available
-              const stillMissing = pending.requiredSecrets.filter(name => !this.secretStore[name]);
-              
-              if (stillMissing.length === 0) {
-                // All secrets available - execute!
-                this.pendingApprovals.delete(requestId);
-                this.onApproval(requestId, pending.level);
-                
-                await this.bot.sendMessage(
-                  msg.chat.id,
-                  `✅ Secret added: ${secretName}\n\nRequest: ${requestId}\nExecuting...`
-                );
-                
-                await this.notifyAgent(`Execution approved (${pending.level}): ${requestId}`);
-                executedAny = true;
-              } else {
-                // Still missing other secrets - send new prompt
-                const nextSecret = stillMissing[0];
-                const keyboard = {
-                  inline_keyboard: [
-                    [
-                      { text: `🔑 Add ${nextSecret}`, callback_data: `add_secret:${nextSecret}:${requestId}` }
-                    ]
-                  ]
-                };
-                
-                const sent = await this.bot.sendMessage(
-                  msg.chat.id,
-                  `✅ Added: ${secretName}\n\n🔑 Still need: ${nextSecret}\n\nRequest: ${requestId}\n\nClick below to add it.`,
-                  {
-                    reply_markup: keyboard
-                  }
-                );
-                
-                // Update pending approval with new message ID
-                pending.messageId = sent.message_id;
-              }
+            if (!pending.requiredSecrets.includes(secretName)) continue;
+
+            const stillMissing = pending.requiredSecrets.filter(name => !this.secretStore[name]);
+
+            if (stillMissing.length === 0) {
+              this.pendingApprovals.delete(requestId);
+              await this.editRequestMessage(requestId, `\n\n✅ Approved (${pending.level}) — executing...`);
+              this.onApproval(requestId, pending.level);
+              await this.notifyAgent(`Execution approved (${pending.level}): ${requestId}`);
+              executedAny = true;
+            } else {
+              const nextSecret = stillMissing[0];
+              await this.editRequestMessage(requestId, `\n\n✅ Approved (${pending.level})\n🔑 Need secret: ${nextSecret}`, {
+                inline_keyboard: [[
+                  { text: `🔑 Add ${nextSecret}`, callback_data: `add_secret:${nextSecret}:${requestId}` }
+                ]]
+              });
             }
           }
-          
-          if (!executedAny) {
-            // No pending approvals - just confirm
-            await this.bot.sendMessage(
-              msg.chat.id,
-              `✅ Secret added: ${secretName}\n\nYou can now approve execution requests that need it.`
-            );
+
+          if (!executedAny && this.pendingApprovals.size === 0) {
+            await this.bot.sendMessage(msg.chat.id, `✅ Secret added: ${secretName}`);
           }
         }
         return;
@@ -418,6 +352,7 @@ Hash: ${codeHash.substring(0, 16)}...`;
       disable_web_page_preview: true
     });
 
+    this.requestMessages.set(requestId, { messageId: sent.message_id, baseText: message });
     console.log(`✅ [${new Date().toISOString()}] Telegram message sent (message_id: ${sent.message_id})`);
     return sent.message_id;
   }
@@ -426,53 +361,46 @@ Hash: ${codeHash.substring(0, 16)}...`;
     try {
       const status = result.success ? '✅ Success' : '❌ Failed';
       const duration = result.duration ? `${result.duration}ms` : 'N/A';
-      
-      // Log execution result to console
-      console.log('\n📊 Execution Result:');
-      console.log(`  Status: ${status}`);
-      console.log(`  Duration: ${duration}`);
-      if (result.stdout) console.log(`  Stdout: ${result.stdout}`);
-      if (result.stderr) console.log(`  Stderr: ${result.stderr}`);
-      if (result.error) console.log(`  Error: ${result.error}`);
-      
-      // Get original message to preserve context
-      let originalMessage = '';
-      try {
-        const msg = await this.bot.getChat(this.chatId);
-        // Can't easily get message text, so we'll send a separate result message instead
-      } catch (e) {
-        // Fallback
-      }
-      
-      // Build result section
-      let resultSection = `\n\n━━━━━━━━━━━━━━━━━━━━\n${status}\nDuration: ${duration}`;
-      
+
+      let suffix = `\n\n${status} (${duration})`;
       if (result.success && result.stdout) {
-        const output = result.stdout.substring(0, 400);
-        resultSection += `\n\nOutput:\n${output}`;
-        if (result.stdout.length > 400) {
-          resultSection += `\n... (truncated)`;
-        }
+        const output = result.stdout.substring(0, 300);
+        suffix += `\n<pre>${this.esc(output)}${result.stdout.length > 300 ? '\n...' : ''}</pre>`;
       } else if (result.error) {
-        // Shorten error for readability
-        const shortError = result.error.length > 200 
-          ? result.error.substring(0, 200) + '...' 
-          : result.error;
-        resultSection += `\n\nError:\n${shortError}`;
+        const short = result.error.substring(0, 200);
+        suffix += `\n<pre>${this.esc(short)}${result.error.length > 200 ? '...' : ''}</pre>`;
       }
-      
-      // Send as new message to preserve context
-      await this.bot.sendMessage(this.chatId, resultSection, {
-        reply_to_message_id: messageId
-      });
-      
-      // Notify agent of completion
-      const notificationText = result.success 
-        ? `Execution completed successfully: ${requestId} (${duration})`
+
+      await this.editRequestMessage(requestId, suffix);
+
+      const notif = result.success
+        ? `Execution completed: ${requestId} (${duration})`
         : `Execution failed: ${requestId} - ${result.error || 'Unknown error'}`;
-      await this.notifyAgent(notificationText);
+      await this.notifyAgent(notif);
     } catch (error) {
       console.error('Failed to update message:', error);
+    }
+  }
+
+  private esc(s: string): string {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  private async editRequestMessage(requestId: string, appendText: string, replyMarkup?: any): Promise<void> {
+    const reqMsg = this.requestMessages.get(requestId);
+    if (!reqMsg) return;
+
+    reqMsg.baseText += appendText;
+    try {
+      await this.bot.editMessageText(reqMsg.baseText, {
+        chat_id: this.chatId,
+        message_id: reqMsg.messageId,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        reply_markup: replyMarkup || { inline_keyboard: [] }
+      });
+    } catch (e) {
+      console.error('Failed to edit message:', e);
     }
   }
 
