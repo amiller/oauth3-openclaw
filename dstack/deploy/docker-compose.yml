@@ -1,7 +1,6 @@
 services:
   openclaw:
     image: h4x3rotab/openclaw-cvm@sha256:f0e1c170b5f122753011c1cfb47c939dbec2f65e1f1ead64a3c4c912615b39a2
-    container_name: openclaw
     privileged: true
     ports:
       - "1022:22"
@@ -10,24 +9,29 @@ services:
       - /home/root/.ssh:/root/.ssh:ro
       - openclaw_data:/data
       - docker_data:/var/lib/docker
+      - /var/run/dstack.sock:/var/run/dstack.sock
     environment:
       NODE_ENV: production
       MASTER_KEY: ${MASTER_KEY:-}
       REDPILL_API_KEY: ${REDPILL_API_KEY:-}
+      ANTHROPIC_OAUTH_TOKEN: ${ANTHROPIC_OAUTH_TOKEN:-}
       TELEGRAM_BOT_TOKEN: ${OPENCLAW_TELEGRAM_BOT_TOKEN:-}
     restart: unless-stopped
     networks:
       - internal
 
   oauth3-proxy:
-    image: ghcr.io/amiller/oauth3-proxy@sha256:3bc0f48ddd7e340c4edf0b3c0fd549659fc2bad82ee6e35c6a12bfbd631fcbe2
-    container_name: oauth3-proxy
+    image: ghcr.io/amiller/oauth3-proxy@sha256:5093371fa46fd61c87a29319352f4359920fa83a1bd1bf00414a7b38f8d58134
+    ports:
+      - "3737:3737"
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       PORT: "3737"
       DB_PATH: /data/proxy.db
       EXECUTOR_MODE: direct
+      PUBLIC_URL: https://b50173318c7332d2a7e63e66770d11b2b6e67043-3737.dstack-pha-prod7.phala.network
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     volumes:
       - oauth3_data:/data
     restart: unless-stopped
@@ -35,26 +39,14 @@ services:
       - internal
 
   ssh:
-    build:
-      context: .
-      dockerfile_inline: |
-        FROM ubuntu:22.04
-        RUN apt-get update && apt-get install -y openssh-server \
-            && mkdir /run/sshd \
-            && sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config \
-            && sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config \
-            && sed -i 's/#Port 22/Port 2222/' /etc/ssh/sshd_config \
-            && sed 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' -i /etc/pam.d/sshd \
-            && mkdir -p /root/.ssh && chmod 700 /root/.ssh
-        EXPOSE 2222
-        CMD ["sh", "-c", "echo \"$SSH_PUBKEY\" > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && /usr/sbin/sshd -D"]
+    image: ghcr.io/amiller/dstack-ssh-sidecar@sha256:619756189423e1ad1452a5606adf57ef72ac5812fcd31933fdd156e53848ab53
     privileged: true
     network_mode: host
     environment:
       SSH_PUBKEY: ${SSH_PUBKEY:-}
     volumes:
       - /:/host/
-      - /var/run/tappd.sock:/var/run/tappd.sock
+      - /var/run/dstack.sock:/var/run/dstack.sock
     restart: unless-stopped
 
 networks:

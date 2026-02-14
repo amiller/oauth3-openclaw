@@ -6,6 +6,7 @@ import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import { ProxyDatabase } from './database.js';
 import { executeSkill, hashCode, parseMetadata, EXECUTOR_MODE } from './executor.js';
+import { analyzeCode, CodeAnalysis } from './analyzer.js';
 import { randomBytes } from 'crypto';
 
 const app = express();
@@ -140,8 +141,18 @@ app.post('/execute', async (req: Request, res: Response) => {
     db.createRequest(requestId, skill_id, skill_url, codeHash, secretsList, args);
     db.storeCode(requestId, code);
 
+    let analysis: string | undefined;
+    if (process.env.ANTHROPIC_API_KEY && !db.getApproval(skill_url, codeHash)) {
+      const cache = {
+        get: (h: string) => db.getAnalysis(h),
+        set: (h: string, a: CodeAnalysis) => db.setAnalysis(h, a.summary)
+      };
+      const result = await analyzeCode(code, metadata, codeHash, cache);
+      analysis = result.summary;
+    }
+
     if (telegramBot) {
-      const messageId = await telegramBot.sendApprovalRequest(requestId, skill_id, skill_url, metadata, codeHash, args);
+      const messageId = await telegramBot.sendApprovalRequest(requestId, skill_id, skill_url, metadata, codeHash, args, analysis);
       db.updateRequestStatus(requestId, 'pending', messageId);
     }
 

@@ -73,6 +73,12 @@ export class ProxyDatabase {
         updated_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS code_analysis (
+        code_hash TEXT PRIMARY KEY,
+        summary TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_requests_status ON execution_requests(status);
       CREATE INDEX IF NOT EXISTS idx_requests_created ON execution_requests(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_approvals_expires ON skill_approvals(expires_at);
@@ -221,6 +227,20 @@ export class ProxyDatabase {
   getCode(requestId: string): string | null {
     const row = this.db.prepare('SELECT code FROM execution_requests WHERE id = ?').get(requestId) as { code: string | null } | undefined;
     return row?.code ?? null;
+  }
+
+  // Code analysis cache
+
+  getAnalysis(codeHash: string): { summary: string; timestamp: number } | undefined {
+    return this.db.prepare(
+      'SELECT summary, created_at as timestamp FROM code_analysis WHERE code_hash = ?'
+    ).get(codeHash) as { summary: string; timestamp: number } | undefined;
+  }
+
+  setAnalysis(codeHash: string, summary: string): void {
+    this.db.prepare(
+      'INSERT OR REPLACE INTO code_analysis (code_hash, summary, created_at) VALUES (?, ?, ?)'
+    ).run(codeHash, summary, Date.now());
   }
 
   close(): void {

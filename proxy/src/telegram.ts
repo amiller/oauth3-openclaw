@@ -337,7 +337,8 @@ export class TelegramApprovalBot {
       timeout: number;
     },
     codeHash: string,
-    args?: Record<string, any>
+    args?: Record<string, any>,
+    analysis?: string
   ): Promise<number> {
     console.log(`📤 [${new Date().toISOString()}] Sending Telegram approval request for ${requestId}`);
     
@@ -384,7 +385,7 @@ ${codeLink}
 💬 <a href="${escHtml(claudeLink)}">Discuss in Claude</a>
 
 Description: ${metadata.description}
-
+${analysis ? `\n🤖 <b>Haiku Analysis:</b>\n<pre>${escHtml(analysis)}</pre>` : ''}
 Hash: ${codeHash.substring(0, 16)}...`;
 
     // Check if code is already trusted (for keyboard)
