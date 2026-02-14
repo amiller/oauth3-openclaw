@@ -195,9 +195,7 @@ async function executeInBackground(requestId: string, code: string, metadata: an
     if (missingSecrets.length > 0) {
       console.log(`  Missing secrets: ${missingSecrets.join(', ')}`);
       db.updateRequestStatus(requestId, 'awaiting_secrets');
-      for (const name of missingSecrets) {
-        if (telegramBot) await telegramBot.requestSecret(requestId, name);
-      }
+      if (telegramBot) await telegramBot.requestSecret(requestId, missingSecrets[0], missingSecrets);
       return;
     }
 

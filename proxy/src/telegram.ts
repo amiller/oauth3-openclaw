@@ -256,6 +256,8 @@ export class TelegramApprovalBot {
         await this.handleAddSecret(msg);
       } else if (msg.text === '/list_secrets') {
         await this.handleListSecrets(msg);
+      } else if (msg.text?.startsWith('/delete_secret ')) {
+        await this.handleDeleteSecret(msg);
       }
     });
   }
@@ -467,33 +469,40 @@ Hash: ${codeHash.substring(0, 16)}...`;
     }
   }
 
-  async requestSecret(requestId: string, secretName: string): Promise<void> {
-    try {
-      const message = `🔑 Missing Secret Required
-
-Request: ${requestId}
-Secret: ${secretName}
-
-Click the button below to add this secret securely.
-
-After adding the secret, the execution will automatically retry.`;
-
-      const keyboard = {
-        inline_keyboard: [
-          [
-            { text: `🔑 Add ${secretName}`, callback_data: `add_secret:${secretName}` }
-          ]
-        ]
-      };
-
-      await this.bot.sendMessage(this.chatId, message, {
-        reply_markup: keyboard
-      });
-      
-      console.log(`📨 Requested secret ${secretName} for ${requestId}`);
-    } catch (error) {
-      console.error('Error requesting secret:', error);
+  private async handleDeleteSecret(msg: TelegramBot.Message): Promise<void> {
+    const name = (msg.text || '').split(' ')[1];
+    if (!name) {
+      await this.bot.sendMessage(msg.chat.id, '❌ Usage: /delete_secret SECRET_NAME');
+      return;
     }
+    if (!this.secretStore[name]) {
+      await this.bot.sendMessage(msg.chat.id, `❌ Secret not found: ${name}`);
+      return;
+    }
+    delete this.secretStore[name];
+    this.db.deleteSecret(name);
+    await this.bot.sendMessage(msg.chat.id, `🗑 Deleted: ${name}`);
+    console.log(`🗑 Secret deleted via Telegram: ${name}`);
+  }
+
+  async requestSecret(requestId: string, secretName: string, allMissing?: string[]): Promise<void> {
+    const missing = allMissing || [secretName];
+    // Edit original message inline + register pending so secret addition resumes execution
+    await this.editRequestMessage(requestId, `\n\n🔑 Need secret: ${secretName}`, {
+      inline_keyboard: [[
+        { text: `🔑 Add ${secretName}`, callback_data: `add_secret:${secretName}:${requestId}` }
+      ]]
+    });
+
+    // Register as pending so secret-add handler can resume execution
+    const reqMsg = this.requestMessages.get(requestId);
+    if (reqMsg) {
+      this.pendingApprovals.set(requestId, {
+        requestId, level: 'once', messageId: reqMsg.messageId, requiredSecrets: missing
+      });
+    }
+
+    console.log(`📨 Requested secret ${secretName} for ${requestId}`);
   }
 
   stop(): void {
