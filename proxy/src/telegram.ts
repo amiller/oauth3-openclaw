@@ -93,31 +93,52 @@ export class TelegramApprovalBot {
         const action = parts[0];
 
         if (action === 'add_secret') {
-          // Handle "Add SECRET_NAME" button
           const secretName = parts[1];
-          const relatedRequestId = parts[2]; // Optional - if this secret is for a pending approval
-          
+          const relatedRequestId = parts[2];
           await this.bot.answerCallbackQuery(query.id, {
             text: `Reply to this message with the value for ${secretName}`
           });
-          
-          // Send a force_reply message
-          const sent = await this.bot.sendMessage(
+          await this.bot.sendMessage(
             query.message!.chat.id,
             `🔑 Add Secret: ${secretName}\n\nReply to this message with the secret value.\n\n⚠️ The message will be deleted immediately for security.`,
-            {
-              reply_markup: {
-                force_reply: true,
-                selective: true
-              }
-            }
+            { reply_markup: { force_reply: true, selective: true } }
           );
-          
-          // Store metadata so we know which request this secret is for
-          if (relatedRequestId) {
-            (sent as any)._relatedRequestId = relatedRequestId;
+          return;
+        }
+
+        if (action === 'delete_secret') {
+          const secretName = parts[1];
+          if (!this.secretStore[secretName]) {
+            await this.bot.answerCallbackQuery(query.id, { text: `Not found: ${secretName}` });
+            return;
           }
-          
+          delete this.secretStore[secretName];
+          this.db.deleteSecret(secretName);
+          await this.bot.answerCallbackQuery(query.id, { text: `Deleted: ${secretName}` });
+          console.log(`🗑 Secret deleted via menu: ${secretName}`);
+          await this.refreshSecretsMenu(query.message!);
+          return;
+        }
+
+        if (action === 'replace_secret') {
+          const secretName = parts[1];
+          await this.bot.answerCallbackQuery(query.id, {
+            text: `Reply with the new value for ${secretName}`
+          });
+          await this.bot.sendMessage(
+            query.message!.chat.id,
+            `🔑 Add Secret: ${secretName}\n\nReply to this message with the secret value.\n\n⚠️ The message will be deleted immediately for security.`,
+            { reply_markup: { force_reply: true, selective: true } }
+          );
+          return;
+        }
+
+        if (action === 'add_new_secret') {
+          await this.bot.answerCallbackQuery(query.id);
+          await this.bot.sendMessage(
+            query.message!.chat.id,
+            '➕ Add a new secret:\n\n/add_secret SECRET_NAME secret_value'
+          );
           return;
         }
 
@@ -254,8 +275,8 @@ export class TelegramApprovalBot {
         );
       } else if (msg.text?.startsWith('/add_secret ')) {
         await this.handleAddSecret(msg);
-      } else if (msg.text === '/list_secrets') {
-        await this.handleListSecrets(msg);
+      } else if (msg.text === '/list_secrets' || msg.text === '/secrets') {
+        await this.handleSecretsMenu(msg);
       } else if (msg.text?.startsWith('/delete_secret ')) {
         await this.handleDeleteSecret(msg);
       }
@@ -446,26 +467,41 @@ Hash: ${codeHash.substring(0, 16)}...`;
     }
   }
 
-  private async handleListSecrets(msg: TelegramBot.Message): Promise<void> {
+  private secretsMenuKeyboard(): TelegramBot.InlineKeyboardMarkup {
+    const secretNames = Object.keys(this.secretStore);
+    const rows = secretNames.map(name => [
+      { text: `🔄 ${name}`, callback_data: `replace_secret:${name}` },
+      { text: `🗑`, callback_data: `delete_secret:${name}` }
+    ]);
+    rows.push([{ text: '➕ Add New', callback_data: 'add_new_secret:' }]);
+    return { inline_keyboard: rows };
+  }
+
+  private async handleSecretsMenu(msg: TelegramBot.Message): Promise<void> {
+    const secretNames = Object.keys(this.secretStore);
+    if (secretNames.length === 0) {
+      await this.bot.sendMessage(msg.chat.id, '📋 No secrets stored.\n\n/add_secret SECRET_NAME value');
+      return;
+    }
+    await this.bot.sendMessage(msg.chat.id,
+      `📋 Secrets (${secretNames.length}):`, {
+      reply_markup: this.secretsMenuKeyboard()
+    });
+  }
+
+  private async refreshSecretsMenu(msg: TelegramBot.Message): Promise<void> {
+    const secretNames = Object.keys(this.secretStore);
+    const text = secretNames.length === 0
+      ? '📋 No secrets stored.'
+      : `📋 Secrets (${secretNames.length}):`;
     try {
-      const secretNames = Object.keys(this.secretStore);
-      
-      if (secretNames.length === 0) {
-        await this.bot.sendMessage(
-          msg.chat.id,
-          '📋 No secrets stored.\n\nAdd one with:\n/add_secret SECRET_NAME secret_value'
-        );
-        return;
-      }
-      
-      const list = secretNames.map(name => `• ${name}`).join('\n');
-      await this.bot.sendMessage(
-        msg.chat.id,
-        `📋 Stored secrets (${secretNames.length}):\n\n${list}\n\n✅ Persisted to database`
-      );
-    } catch (error) {
-      console.error('Error listing secrets:', error);
-      await this.bot.sendMessage(msg.chat.id, '❌ Failed to list secrets');
+      await this.bot.editMessageText(text, {
+        chat_id: msg.chat.id,
+        message_id: msg.message_id,
+        reply_markup: secretNames.length > 0 ? this.secretsMenuKeyboard() : undefined
+      });
+    } catch (e) {
+      console.error('Failed to refresh secrets menu:', e);
     }
   }
 
