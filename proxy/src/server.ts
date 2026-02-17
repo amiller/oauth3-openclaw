@@ -125,6 +125,100 @@ if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
   console.log('✅ Telegram bot initialized');
 }
 
+// Discovery — protocol documentation for agents
+app.get('/', (req: Request, res: Response) => {
+  res.type('text/markdown').send(`# OAuth3 Execution Proxy
+
+Programmable API gateway running in a TEE (Trusted Execution Environment).
+Submit code that runs in a Deno sandbox with access to secrets you don't hold directly.
+Human approval gates execution — or session policies auto-approve within learned bounds.
+
+## Quick Start
+
+1. **Submit code** via \`POST /execute\`
+2. **Poll for result** via \`GET /execute/:id/status?wait=true\` (long-polls up to 120s)
+3. If status is \`pending\`, the \`approval_url\` in the response needs human approval first
+4. Result arrives in \`result.stdout\` — return all output as text/JSON on stdout
+
+## Endpoints
+
+### POST /execute
+Submit code for sandboxed execution.
+
+\`\`\`json
+{
+  "skill_id": "my-task",
+  "skill_code": "// @skill my-task\\n// @description Fetch something\\n// @secrets API_KEY\\n// @network api.example.com\\n// @timeout 30\\nconst r = await fetch('https://api.example.com', {headers: {Authorization: Deno.env.get('API_KEY')!}});\\nconsole.log(await r.text());",
+  "secrets": ["API_KEY"],
+  "args": {"key": "value"},
+  "session_id": "optional-reuse-for-auto-approve"
+}
+\`\`\`
+
+Response: \`{ request_id, status, session_id, approval_url }\`
+
+- \`status: "approved"\` — already executing (trusted code or session auto-approve)
+- \`status: "pending"\` — needs human approval at \`approval_url\`
+
+### GET /execute/:id/status?wait=true
+Long-polls up to 120s. Returns when status reaches a terminal state.
+
+Response: \`{ request_id, status, result, error }\`
+- \`result.stdout\` — your program's stdout (this is the output channel)
+- \`result.stderr\` — stderr
+- \`result.exitCode\` — 0 on success
+- \`result.duration\` — ms
+
+### POST /secrets — \`{ name, value }\`
+### GET /secrets — list secret names (not values)
+### GET /health — status check
+
+## Code Format
+
+Code must have metadata comments:
+\`\`\`typescript
+// @skill name-of-task
+// @description What this does
+// @secrets SECRET_NAME (one per line, each secret you need)
+// @network hostname.com (one per line, each host you'll access)
+// @timeout 30 (seconds, default 30)
+
+// Your Deno/TypeScript code here
+// Secrets available via Deno.env.get("SECRET_NAME")
+// Args available via Deno.env.get("ARG_KEY")
+// All output goes to stdout — use console.log() or Deno.stdout
+\`\`\`
+
+## Output Convention
+
+stdout is the output channel. For structured data, print JSON:
+\`\`\`typescript
+console.log(JSON.stringify({ files: [...], data: {...} }));
+\`\`\`
+For binary data, base64-encode it:
+\`\`\`typescript
+import { encode } from "https://deno.land/std/encoding/base64.ts";
+console.log(JSON.stringify({ filename: "out.zip", data: encode(bytes) }));
+\`\`\`
+Max output: ~1MB. stderr is captured separately for diagnostics.
+
+## Sessions & Auto-Approval
+
+Pass \`session_id\` to group related requests. After the first manual approval,
+the proxy learns a policy (allowed secrets, networks, mutation flag, risk level).
+Subsequent requests that fit within the policy auto-approve for 2 hours.
+
+Trusted code (approved with "Trust Code") auto-executes forever by code hash.
+
+## Available Secrets
+${Object.keys(secrets).map(s => '- ' + s).join('\n') || '(none configured)'}
+
+---
+Public URL: ${PUBLIC_URL || '(not configured)'}
+Executor: ${EXECUTOR_MODE} mode
+`);
+});
+
 // Health check
 app.get('/health', (req: Request, res: Response) => {
   res.json({
