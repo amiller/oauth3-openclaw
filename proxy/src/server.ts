@@ -343,7 +343,7 @@ app.post('/execute', async (req: Request, res: Response) => {
     const secretsList = Array.isArray(requiredSecrets) ? requiredSecrets
       : requiredSecrets && typeof requiredSecrets === 'object' ? Object.keys(requiredSecrets) : [];
 
-    db.createRequest(requestId, skill_id, skill_url, codeHash, secretsList, args, approvalToken);
+    db.createRequest(requestId, skill_id, skill_url || 'inline', codeHash, secretsList, args, approvalToken);
     db.storeCode(requestId, code);
 
     // Auto-execute if code is already trusted
