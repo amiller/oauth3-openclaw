@@ -295,6 +295,14 @@ export class ProxyDatabase {
     this.db.prepare('DELETE FROM sessions WHERE session_id = ?').run(sessionId);
   }
 
+  listSessions(): Array<{ session_id: string; created_at: number; last_activity: number; policy: SessionPolicy }> {
+    const now = Date.now();
+    // Clean expired first
+    this.db.prepare('DELETE FROM sessions WHERE ? - last_activity > ?').run(now, 2 * 60 * 60 * 1000);
+    const rows = this.db.prepare('SELECT * FROM sessions ORDER BY last_activity DESC').all() as any[];
+    return rows.map(r => ({ ...r, policy: JSON.parse(r.policy) }));
+  }
+
   close(): void {
     this.db.close();
   }

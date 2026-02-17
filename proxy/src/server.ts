@@ -169,6 +169,17 @@ Response: \`{ request_id, status, result, error }\`
 - \`result.exitCode\` — 0 on success
 - \`result.duration\` — ms
 
+### POST /execute with dry_run
+Same body as above, add \`"dry_run": true\`. Returns what *would* happen without creating a request:
+\`\`\`json
+{ "dry_run": true, "would_auto_approve": true, "reason": "session_policy", "session_id": "...", "analysis": {...} }
+{ "dry_run": true, "would_auto_approve": false, "reason": "needs_approval", "policy_gaps": { "new_secrets": [...], "new_networks": [...] } }
+\`\`\`
+Use this to check if you already have sufficient approval before submitting.
+
+### GET /sessions — list active sessions with policies
+### GET /sessions/:id — single session detail
+### DELETE /sessions/:id — revoke a session
 ### POST /secrets — \`{ name, value }\`
 ### GET /secrets — list secret names (not values)
 ### GET /health — status check
@@ -241,6 +252,45 @@ app.post('/secrets', (req: Request, res: Response) => {
 // List secrets (names only)
 app.get('/secrets', (req: Request, res: Response) => {
   res.json({ secrets: Object.keys(secrets) });
+});
+
+// List active sessions
+app.get('/sessions', (req: Request, res: Response) => {
+  const sessions = db.listSessions();
+  res.json({
+    sessions: sessions.map(s => ({
+      session_id: s.session_id,
+      created_at: s.created_at,
+      last_activity: s.last_activity,
+      age_minutes: Math.round((Date.now() - s.created_at) / 60000),
+      idle_minutes: Math.round((Date.now() - s.last_activity) / 60000),
+      policy: s.policy
+    }))
+  });
+});
+
+// Get single session
+app.get('/sessions/:id', (req: Request, res: Response) => {
+  const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
+  const session = db.getSession(id);
+  if (!session) return res.status(404).json({ error: 'Session not found or expired' });
+  res.json({
+    session_id: session.session_id,
+    created_at: session.created_at,
+    last_activity: session.last_activity,
+    age_minutes: Math.round((Date.now() - session.created_at) / 60000),
+    idle_minutes: Math.round((Date.now() - session.last_activity) / 60000),
+    policy: session.policy
+  });
+});
+
+// Revoke session
+app.delete('/sessions/:id', (req: Request, res: Response) => {
+  const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
+  const session = db.getSession(id);
+  if (!session) return res.status(404).json({ error: 'Session not found or expired' });
+  db.deleteSession(id);
+  res.json({ deleted: true, session_id: id });
 });
 
 // View code for an execution request
@@ -412,10 +462,10 @@ a{color:#89b4fa}</style>
 </body></html>`);
 });
 
-// Request execution
+// Request execution (supports dry_run: true to check without executing)
 app.post('/execute', async (req: Request, res: Response) => {
   try {
-    const { skill_id, skill_url, skill_code, secrets: requiredSecrets, args, session_id: clientSessionId } = req.body;
+    const { skill_id, skill_url, skill_code, secrets: requiredSecrets, args, session_id: clientSessionId, dry_run } = req.body;
     if (!skill_id) return res.status(400).json({ error: 'Missing skill_id' });
     if (!skill_url && !skill_code) return res.status(400).json({ error: 'Missing skill_url or skill_code' });
     const sessionId = clientSessionId || `session_${randomBytes(8).toString('hex')}`;
@@ -432,23 +482,19 @@ app.post('/execute', async (req: Request, res: Response) => {
     const metadata = parseMetadata(code);
     if (!metadata) return res.status(400).json({ error: 'Invalid skill format - missing metadata' });
 
-    const requestId = `exec_${randomBytes(8).toString('hex')}`;
-    const approvalToken = randomBytes(32).toString('hex');
     const secretsList = Array.isArray(requiredSecrets) ? requiredSecrets
       : requiredSecrets && typeof requiredSecrets === 'object' ? Object.keys(requiredSecrets) : [];
 
-    db.createRequest(requestId, skill_id, skill_url || 'inline', codeHash, secretsList, args, approvalToken);
-    db.storeCode(requestId, code);
-
-    // Auto-execute if code is already trusted
-    const existingApproval = db.getApproval(skill_url, codeHash);
+    // Check what approval path this would take
+    const existingApproval = db.getApproval(skill_url || 'inline', codeHash);
     if (existingApproval) {
+      if (dry_run) return res.json({ dry_run: true, would_auto_approve: true, reason: 'trusted_code', session_id: sessionId });
+      const requestId = `exec_${randomBytes(8).toString('hex')}`;
+      const approvalToken = randomBytes(32).toString('hex');
+      db.createRequest(requestId, skill_id, skill_url || 'inline', codeHash, secretsList, args, approvalToken);
+      db.storeCode(requestId, code);
       console.log(`⚡ Auto-executing trusted code: ${codeHash.substring(0, 16)}...`);
       db.updateRequestStatus(requestId, 'approved');
-      if (telegramBot) {
-        const messageId = await telegramBot.sendAutoApproveNotification(requestId, skill_id, metadata, codeHash);
-        db.updateRequestStatus(requestId, 'approved', messageId);
-      }
       executeInBackground(requestId, code, metadata, secretsList);
       return res.json({ request_id: requestId, status: 'approved', message: 'Auto-approved (trusted code)' });
     }
@@ -463,24 +509,49 @@ app.post('/execute', async (req: Request, res: Response) => {
       analysis = await analyzeCode(code, metadata, codeHash, cache);
     }
 
-    // Check session policy — auto-approve if skill fits within bounds
+    // Check session policy
     const session = db.getSession(sessionId);
     if (session && analysis) {
       const fits = skillFitsPolicy(analysis, session.policy);
       if (fits) {
+        if (dry_run) return res.json({ dry_run: true, would_auto_approve: true, reason: 'session_policy', session_id: sessionId, analysis });
         console.log(`⚡ Auto-approved via session ${sessionId}: ${skill_id}`);
+        const requestId = `exec_${randomBytes(8).toString('hex')}`;
+        const approvalToken = randomBytes(32).toString('hex');
+        db.createRequest(requestId, skill_id, skill_url || 'inline', codeHash, secretsList, args, approvalToken);
+        db.storeCode(requestId, code);
         db.touchSession(sessionId);
         db.updateRequestStatus(requestId, 'approved');
-        if (telegramBot) {
-          const messageId = await telegramBot.sendSessionAutoApproveNotification(requestId, skill_id, metadata, codeHash, sessionId, analysis);
-          db.updateRequestStatus(requestId, 'approved', messageId);
-        }
         executeInBackground(requestId, code, metadata, secretsList);
         return res.json({ request_id: requestId, status: 'approved', session_id: sessionId, message: 'Auto-approved (session policy)' });
       }
     }
 
-    // Store session_id in request metadata for onApproval to create/expand session
+    // Would need human approval
+    if (dry_run) {
+      const missingSecrets = secretsList.filter((s: string) => !secrets[s]);
+      return res.json({
+        dry_run: true,
+        would_auto_approve: false,
+        reason: 'needs_approval',
+        session_id: sessionId,
+        session_exists: !!session,
+        analysis,
+        policy_gaps: session && analysis ? {
+          new_secrets: analysis.secretsUsed.filter(s => !session.policy.allowedSecrets.includes(s)),
+          new_networks: analysis.networkTargets.filter(n => !session.policy.allowedNetworks.includes(n)),
+          risk_escalation: session ? RISK_LEVELS[analysis?.riskLevel || 'medium'] > RISK_LEVELS[session.policy.maxRiskLevel] : false,
+          mutation_escalation: analysis?.isMutating && session ? !session.policy.allowMutating : false
+        } : undefined,
+        missing_secrets: missingSecrets.length > 0 ? missingSecrets : undefined
+      });
+    }
+
+    const requestId = `exec_${randomBytes(8).toString('hex')}`;
+    const approvalToken = randomBytes(32).toString('hex');
+    db.createRequest(requestId, skill_id, skill_url || 'inline', codeHash, secretsList, args, approvalToken);
+    db.storeCode(requestId, code);
+
     pendingSessionIds.set(requestId, sessionId);
     if (analysis) pendingAnalyses.set(requestId, analysis);
 
