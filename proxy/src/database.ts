@@ -19,6 +19,7 @@ export interface ExecutionRecord {
   result: string | null; // JSON
   error: string | null;
   telegram_message_id: number | null;
+  approval_token: string | null;
 }
 
 export interface ApprovalRecord {
@@ -90,8 +91,9 @@ export class ProxyDatabase {
       CREATE INDEX IF NOT EXISTS idx_requests_created ON execution_requests(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_approvals_expires ON skill_approvals(expires_at);
     `);
-    // Migrate: add code column if missing
+    // Migrations
     try { this.db.exec('ALTER TABLE execution_requests ADD COLUMN code TEXT'); } catch {}
+    try { this.db.exec('ALTER TABLE execution_requests ADD COLUMN approval_token TEXT'); } catch {}
   }
 
   // Execution Requests
@@ -102,11 +104,12 @@ export class ProxyDatabase {
     skillUrl: string,
     codeHash: string,
     secrets: string[],
-    args?: Record<string, any>
+    args?: Record<string, any>,
+    approvalToken?: string
   ): void {
     this.db.prepare(`
-      INSERT INTO execution_requests (id, skill_id, skill_url, code_hash, secrets, args, status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+      INSERT INTO execution_requests (id, skill_id, skill_url, code_hash, secrets, args, status, created_at, approval_token)
+      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
     `).run(
       id,
       skillId,
@@ -114,7 +117,8 @@ export class ProxyDatabase {
       codeHash,
       JSON.stringify(secrets),
       args ? JSON.stringify(args) : null,
-      Date.now()
+      Date.now(),
+      approvalToken || null
     );
   }
 

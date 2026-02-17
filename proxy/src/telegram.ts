@@ -544,6 +544,33 @@ Hash: ${codeHash.substring(0, 16)}...`;
     console.log(`📨 Requested secret ${secretName} for ${requestId}`);
   }
 
+  async sendApprovalLink(
+    requestId: string,
+    skillId: string,
+    metadata: { description: string; secrets: string[]; network: string[]; timeout: number },
+    approvalUrl: string,
+    analysis?: string
+  ): Promise<number> {
+    const escHtml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+    const message = `🔐 Approval needed
+
+Skill: ${skillId}
+Secrets: ${metadata.secrets.join(', ') || 'none'}
+Network: ${metadata.network.join(', ') || 'none'}
+${analysis ? `\n🤖 ${escHtml(analysis).substring(0, 200)}` : ''}
+
+👉 <a href="${escHtml(approvalUrl)}">Review &amp; Approve</a>`;
+
+    const sent = await this.bot.sendMessage(this.chatId, message, {
+      parse_mode: 'HTML',
+      disable_web_page_preview: true
+    });
+    this.requestMessages.set(requestId, { messageId: sent.message_id, baseText: message });
+    this.requestMetadata.set(requestId, metadata.secrets);
+    return sent.message_id;
+  }
+
   async sendSessionStartNotification(sessionId: string, policy: SessionPolicy): Promise<void> {
     const msg = `📋 Session started: ${sessionId.substring(0, 16)}...
 

@@ -11,6 +11,7 @@ import { randomBytes } from 'crypto';
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
 
 // Config from environment
 const PORT = parseInt(process.env.PORT || '3737');
@@ -175,6 +176,148 @@ h1{color:#89b4fa;font-size:1.2em} .meta{color:#6c7086;margin-bottom:1em}
 </body></html>`);
 });
 
+// Web-based approval page (served from TEE)
+app.get('/approve/:id', (req: Request, res: Response) => {
+  const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
+  const token = req.query.token as string;
+  const request = db.getRequest(id);
+  if (!request) return res.status(404).send('Not found');
+  if (!token || token !== request.approval_token) return res.status(403).send('Invalid token');
+
+  const code = db.getCode(id) || '';
+  const metadata = parseMetadata(code);
+  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const analysisData = db.getAnalysis(request.code_hash);
+  const analysisSummary = analysisData?.summary || '';
+
+  const terminal = ['completed', 'failed', 'denied', 'approved', 'executing'];
+  if (terminal.includes(request.status)) {
+    const resultData = request.result ? JSON.parse(request.result) : null;
+    return res.type('html').send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>${esc(metadata?.skill || id)}</title>
+<style>
+body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;margin:0;padding:1.5em;max-width:700px;margin:0 auto}
+pre{background:#181825;padding:1em;border-radius:8px;overflow-x:auto;line-height:1.5;font-size:0.85em}
+h1{color:#89b4fa;font-size:1.2em} .meta{color:#6c7086;margin-bottom:1em}
+.status{font-size:1.1em;margin:1em 0;padding:0.8em;border-radius:8px;background:#181825}
+</style></head><body>
+<h1>${esc(metadata?.skill || 'Skill')}</h1>
+<div class="status">${request.status === 'completed' ? '✅' : request.status === 'denied' ? '❌' : '⏳'} Status: ${esc(request.status)}${resultData?.stdout ? `\n<pre>${esc(resultData.stdout.substring(0, 500))}</pre>` : ''}${request.error ? `\n<pre>${esc(request.error.substring(0, 500))}</pre>` : ''}</div>
+</body></html>`);
+  }
+
+  res.type('html').send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Approve: ${esc(metadata?.skill || id)}</title>
+<style>
+body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;margin:0;padding:1.5em;max-width:700px;margin:0 auto}
+pre{background:#181825;padding:1em;border-radius:8px;overflow-x:auto;line-height:1.5;font-size:0.85em}
+h1{color:#89b4fa;font-size:1.2em} .meta{color:#6c7086;margin-bottom:1em}
+.actions{margin:1.5em 0;display:flex;gap:0.5em;flex-wrap:wrap}
+button{font-family:monospace;font-size:1em;padding:0.6em 1.2em;border:none;border-radius:6px;cursor:pointer}
+.approve{background:#a6e3a1;color:#1e1e2e} .approve:hover{background:#94e296}
+.trust{background:#89b4fa;color:#1e1e2e} .trust:hover{background:#74a8f7}
+.deny{background:#f38ba8;color:#1e1e2e} .deny:hover{background:#f07a9a}
+.analysis{background:#181825;padding:1em;border-radius:8px;border-left:3px solid #89b4fa;margin:1em 0}
+</style></head><body>
+<h1>${esc(metadata?.skill || 'Skill')}</h1>
+<div class="meta">
+${esc(metadata?.description || '')}
+<br>Hash: ${esc(request.code_hash.substring(0, 16))}...
+<br>Secrets: ${esc(metadata?.secrets?.join(', ') || 'none')}
+<br>Network: ${esc(metadata?.network?.join(', ') || 'none')}
+<br>Timeout: ${metadata?.timeout || 30}s
+</div>
+${analysisSummary ? `<div class="analysis"><b>Analysis:</b><br>${esc(analysisSummary)}</div>` : ''}
+<pre>${esc(code)}</pre>
+<div class="actions">
+<form method="POST" style="display:inline">
+  <input type="hidden" name="token" value="${esc(token)}">
+  <input type="hidden" name="action" value="approve">
+  <input type="hidden" name="level" value="once">
+  <button type="submit" class="approve">✅ Run Once</button>
+</form>
+<form method="POST" style="display:inline">
+  <input type="hidden" name="token" value="${esc(token)}">
+  <input type="hidden" name="action" value="approve">
+  <input type="hidden" name="level" value="trust_code">
+  <button type="submit" class="trust">🔒 Trust Code</button>
+</form>
+<form method="POST" style="display:inline">
+  <input type="hidden" name="token" value="${esc(token)}">
+  <input type="hidden" name="action" value="deny">
+  <button type="submit" class="deny">❌ Deny</button>
+</form>
+</div>
+</body></html>`);
+});
+
+// Process web approval
+app.post('/approve/:id', async (req: Request, res: Response) => {
+  const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
+  const { token, action, level } = req.body;
+  const request = db.getRequest(id);
+  if (!request) return res.status(404).send('Not found');
+  if (!token || token !== request.approval_token) return res.status(403).send('Invalid token');
+  if (request.status !== 'pending') return res.redirect(`/approve/${id}?token=${token}`);
+
+  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  if (action === 'deny') {
+    db.updateRequestStatus(id, 'denied');
+    notifyStatusWaiters(id);
+    if (telegramBot) {
+      const reqMsg = request.telegram_message_id;
+      if (reqMsg) await telegramBot.updateExecution(reqMsg, id, { success: false, error: 'Denied via web', duration: 0 });
+    }
+    return res.type('html').send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<style>body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;padding:2em;text-align:center}</style>
+</head><body><h2>❌ Denied</h2><p>Request ${esc(id)} was denied.</p></body></html>`);
+  }
+
+  // Approve
+  const approvalLevel = (level as 'once' | 'trust_code') || 'once';
+  if (approvalLevel === 'trust_code') {
+    db.addApproval(request.skill_url, request.code_hash, 'forever');
+  }
+
+  // Session handling
+  const sessionId = pendingSessionIds.get(id);
+  const analysisData = pendingAnalyses.get(id);
+  if (sessionId && analysisData) {
+    const existing = db.getSession(sessionId);
+    if (existing) {
+      db.updateSessionPolicy(sessionId, mergePolicy(existing.policy, analysisData));
+    } else {
+      db.createSession(sessionId, policyFromAnalysis(analysisData));
+    }
+    pendingSessionIds.delete(id);
+    pendingAnalyses.delete(id);
+  }
+
+  db.updateRequestStatus(id, 'approved');
+
+  let code = db.getCode(id);
+  if (!code) {
+    const codeResponse = await fetch(request.skill_url);
+    code = await codeResponse.text();
+  }
+  const metadata = parseMetadata(code);
+  const requiredSecrets = JSON.parse(request.secrets);
+  executeInBackground(id, code, metadata!, requiredSecrets);
+
+  res.type('html').send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<style>body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;padding:2em;text-align:center}
+a{color:#89b4fa}</style>
+</head><body><h2>✅ Approved</h2><p>Executing ${esc(request.skill_id)}...</p>
+<p><a href="/approve/${esc(id)}?token=${esc(token)}">View status</a></p>
+<script>setTimeout(()=>location.reload(),3000)</script>
+</body></html>`);
+});
+
 // Request execution
 app.post('/execute', async (req: Request, res: Response) => {
   try {
@@ -191,10 +334,11 @@ app.post('/execute', async (req: Request, res: Response) => {
     if (!metadata) return res.status(400).json({ error: 'Invalid skill format - missing metadata' });
 
     const requestId = `exec_${randomBytes(8).toString('hex')}`;
+    const approvalToken = randomBytes(32).toString('hex');
     const secretsList = Array.isArray(requiredSecrets) ? requiredSecrets
       : requiredSecrets && typeof requiredSecrets === 'object' ? Object.keys(requiredSecrets) : [];
 
-    db.createRequest(requestId, skill_id, skill_url, codeHash, secretsList, args);
+    db.createRequest(requestId, skill_id, skill_url, codeHash, secretsList, args, approvalToken);
     db.storeCode(requestId, code);
 
     // Auto-execute if code is already trusted
@@ -241,12 +385,14 @@ app.post('/execute', async (req: Request, res: Response) => {
     pendingSessionIds.set(requestId, sessionId);
     if (analysis) pendingAnalyses.set(requestId, analysis);
 
-    if (telegramBot) {
-      const messageId = await telegramBot.sendApprovalRequest(requestId, skill_id, skill_url, metadata, codeHash, args, analysis?.summary);
+    const approvalUrl = PUBLIC_URL ? `${PUBLIC_URL}/approve/${requestId}?token=${approvalToken}` : undefined;
+
+    if (telegramBot && approvalUrl) {
+      const messageId = await telegramBot.sendApprovalLink(requestId, skill_id, metadata, approvalUrl, analysis?.summary);
       db.updateRequestStatus(requestId, 'pending', messageId);
     }
 
-    res.json({ request_id: requestId, status: 'pending', session_id: sessionId, message: 'Awaiting approval' });
+    res.json({ request_id: requestId, status: 'pending', session_id: sessionId, approval_url: approvalUrl, message: 'Awaiting approval' });
   } catch (error: any) {
     console.error('Execute error:', error);
     res.status(500).json({ error: error.message });
