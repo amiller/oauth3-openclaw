@@ -305,7 +305,7 @@ a{color:#89b4fa;text-decoration:none} a:hover{text-decoration:underline}
 ${sessions.length === 0 ? '<p class="empty">No active sessions</p>' : `<table>
 <tr><th>Session</th><th>Age</th><th>Idle</th><th>Secrets</th><th>Networks</th><th>Risk</th><th></th></tr>
 ${sessions.map(s => `<tr>
-<td><code>${esc(s.session_id.substring(0, 20))}</code>${s.policy.description ? `<br><small>${esc(s.policy.description.substring(0, 60))}</small>` : ''}</td>
+<td><a href="/dashboard/session/${esc(s.session_id)}?token=${esc(API_BEARER_TOKEN)}"><code>${esc(s.session_id.substring(0, 20))}</code></a>${s.policy.description ? `<br><small>${esc(s.policy.description.substring(0, 60))}</small>` : ''}</td>
 <td>${ago(s.created_at)}</td>
 <td>${ago(s.last_activity)}</td>
 <td>${s.policy.allowedSecrets.map((x: string) => `<span class="tag secret">${esc(x)}</span>`).join(' ') || '—'}</td>
@@ -339,6 +339,56 @@ app.post('/dashboard/revoke', (req: Request, res: Response) => {
   const { session_id } = req.body;
   if (session_id) db.deleteSession(session_id);
   res.redirect(`/dashboard?token=${API_BEARER_TOKEN}`);
+});
+
+// Session detail page
+app.get('/dashboard/session/:id', (req: Request, res: Response) => {
+  if (API_BEARER_TOKEN && req.query.token !== API_BEARER_TOKEN) return res.status(401).send('Unauthorized');
+  const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
+  const session = db.getSession(id);
+  if (!session) return res.status(404).send('Session not found or expired');
+  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const p = session.policy;
+
+  res.type('html').send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Session: ${esc(id.substring(0, 20))}</title>
+<style>
+body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;margin:0;padding:1.5em;max-width:700px;margin:0 auto}
+h1{color:#89b4fa;font-size:1.2em} h2{color:#a6adc8;font-size:1em;margin-top:1.5em}
+.tag{display:inline-block;padding:0.15em 0.5em;border-radius:4px;font-size:0.85em;margin:0.1em}
+.secret{background:#f38ba820;color:#f38ba8} .network{background:#89b4fa20;color:#89b4fa}
+.constraint{background:#181825;padding:0.6em 1em;border-radius:6px;border-left:3px solid #f9e2af;margin:0.4em 0}
+.meta{color:#6c7086} .section{margin:1em 0}
+a{color:#89b4fa;text-decoration:none} a:hover{text-decoration:underline}
+.risk-low{color:#a6e3a1} .risk-medium{color:#f9e2af} .risk-high{color:#f38ba8}
+.btn{font-family:monospace;font-size:0.85em;padding:0.4em 0.8em;border:1px solid #f38ba8;color:#f38ba8;background:none;border-radius:4px;cursor:pointer}
+</style></head><body>
+<p><a href="/dashboard?token=${esc(API_BEARER_TOKEN)}">&larr; Dashboard</a></p>
+<h1>Session</h1>
+<div class="meta"><code>${esc(id)}</code></div>
+${p.description ? `<div class="section"><b>Description:</b> ${esc(p.description)}</div>` : ''}
+<div class="section"><b>Created:</b> ${new Date(session.created_at).toISOString()}<br>
+<b>Last activity:</b> ${new Date(session.last_activity).toISOString()}<br>
+<b>Idle:</b> ${Math.round((Date.now() - session.last_activity) / 60000)} min</div>
+
+<h2>Policy</h2>
+<div class="section">
+<b>Secrets:</b> ${p.allowedSecrets.map(s => `<span class="tag secret">${esc(s)}</span>`).join(' ') || '<span class="meta">none</span>'}<br>
+<b>Networks:</b> ${p.allowedNetworks.map(n => `<span class="tag network">${esc(n)}</span>`).join(' ') || '<span class="meta">none</span>'}<br>
+<b>Mutating:</b> ${p.allowMutating ? 'yes' : 'no'}<br>
+<b>Max risk:</b> <span class="risk-${p.maxRiskLevel}">${p.maxRiskLevel}</span>
+</div>
+
+${p.constraints?.length ? `<h2>Constraints (${p.constraints.length})</h2>
+${p.constraints.map(c => `<div class="constraint">${esc(c)}</div>`).join('')}` : ''}
+
+<div class="section" style="margin-top:2em">
+<form method="POST" action="/dashboard/revoke?token=${esc(API_BEARER_TOKEN)}">
+<input type="hidden" name="session_id" value="${esc(id)}">
+<button class="btn" type="submit">Revoke Session</button>
+</form></div>
+</body></html>`);
 });
 
 // Add secret — persists to SQLite
