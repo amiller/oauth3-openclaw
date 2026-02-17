@@ -4,7 +4,7 @@
 
 import 'dotenv/config';
 import express, { Request, Response } from 'express';
-import { ProxyDatabase } from './database.js';
+import { ProxyDatabase, SessionPolicy } from './database.js';
 import { executeSkill, hashCode, parseMetadata, EXECUTOR_MODE } from './executor.js';
 import { analyzeCode, CodeAnalysis } from './analyzer.js';
 import { randomBytes } from 'crypto';
@@ -28,6 +28,42 @@ import { TelegramApprovalBot } from './telegram.js';
 const secrets: Record<string, string> = db.getAllSecrets();
 console.log(`🔑 Loaded ${Object.keys(secrets).length} secrets from database`);
 
+// Session tracking for pending requests
+const pendingSessionIds = new Map<string, string>();   // requestId -> sessionId
+const pendingAnalyses = new Map<string, CodeAnalysis>(); // requestId -> analysis
+
+const RISK_LEVELS = { low: 0, medium: 1, high: 2 } as const;
+
+function skillFitsPolicy(analysis: CodeAnalysis, policy: SessionPolicy): boolean {
+  // All secrets used must be in the allowed set
+  if (analysis.secretsUsed.some(s => !policy.allowedSecrets.includes(s))) return false;
+  // All network targets must be in the allowed set
+  if (analysis.networkTargets.some(n => !policy.allowedNetworks.includes(n))) return false;
+  // Mutating only if policy allows
+  if (analysis.isMutating && !policy.allowMutating) return false;
+  // Risk level must not exceed policy
+  if (RISK_LEVELS[analysis.riskLevel] > RISK_LEVELS[policy.maxRiskLevel]) return false;
+  return true;
+}
+
+function policyFromAnalysis(analysis: CodeAnalysis): SessionPolicy {
+  return {
+    allowedSecrets: [...analysis.secretsUsed],
+    allowedNetworks: [...analysis.networkTargets],
+    allowMutating: analysis.isMutating,
+    maxRiskLevel: analysis.riskLevel
+  };
+}
+
+function mergePolicy(existing: SessionPolicy, analysis: CodeAnalysis): SessionPolicy {
+  return {
+    allowedSecrets: [...new Set([...existing.allowedSecrets, ...analysis.secretsUsed])],
+    allowedNetworks: [...new Set([...existing.allowedNetworks, ...analysis.networkTargets])],
+    allowMutating: existing.allowMutating || analysis.isMutating,
+    maxRiskLevel: RISK_LEVELS[analysis.riskLevel] > RISK_LEVELS[existing.maxRiskLevel] ? analysis.riskLevel : existing.maxRiskLevel
+  };
+}
+
 // Telegram bot
 let telegramBot: TelegramApprovalBot | null = null;
 
@@ -46,9 +82,27 @@ if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
         db.addApproval(request.skill_url, request.code_hash, level);
       }
 
+      // Create or expand session from this approval
+      const sessionId = pendingSessionIds.get(requestId);
+      const analysis = pendingAnalyses.get(requestId);
+      if (sessionId && analysis) {
+        const existing = db.getSession(sessionId);
+        if (existing) {
+          db.updateSessionPolicy(sessionId, mergePolicy(existing.policy, analysis));
+          console.log(`📋 Session ${sessionId} expanded`);
+        } else {
+          db.createSession(sessionId, policyFromAnalysis(analysis));
+          console.log(`📋 Session ${sessionId} created`);
+          if (telegramBot) {
+            await telegramBot.sendSessionStartNotification(sessionId, policyFromAnalysis(analysis));
+          }
+        }
+        pendingSessionIds.delete(requestId);
+        pendingAnalyses.delete(requestId);
+      }
+
       db.updateRequestStatus(requestId, 'approved');
 
-      // Use stored code if available, otherwise re-fetch
       let code = db.getCode(requestId);
       if (!code) {
         const codeResponse = await fetch(request.skill_url);
@@ -62,6 +116,7 @@ if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
     // On denial
     (requestId) => {
       db.updateRequestStatus(requestId, 'denied');
+      notifyStatusWaiters(requestId);
     },
     PUBLIC_URL
   );
@@ -123,8 +178,9 @@ h1{color:#89b4fa;font-size:1.2em} .meta{color:#6c7086;margin-bottom:1em}
 // Request execution
 app.post('/execute', async (req: Request, res: Response) => {
   try {
-    const { skill_id, skill_url, secrets: requiredSecrets, args } = req.body;
+    const { skill_id, skill_url, secrets: requiredSecrets, args, session_id: clientSessionId } = req.body;
     if (!skill_id || !skill_url) return res.status(400).json({ error: 'Missing skill_id or skill_url' });
+    const sessionId = clientSessionId || `session_${randomBytes(8).toString('hex')}`;
 
     const codeResponse = await fetch(skill_url);
     if (!codeResponse.ok) return res.status(400).json({ error: 'Failed to fetch skill code' });
@@ -141,33 +197,100 @@ app.post('/execute', async (req: Request, res: Response) => {
     db.createRequest(requestId, skill_id, skill_url, codeHash, secretsList, args);
     db.storeCode(requestId, code);
 
-    let analysis: string | undefined;
-    if (process.env.ANTHROPIC_API_KEY && !db.getApproval(skill_url, codeHash)) {
-      const cache = {
-        get: (h: string) => db.getAnalysis(h),
-        set: (h: string, a: CodeAnalysis) => db.setAnalysis(h, a.summary)
-      };
-      const result = await analyzeCode(code, metadata, codeHash, cache);
-      analysis = result.summary;
+    // Auto-execute if code is already trusted
+    const existingApproval = db.getApproval(skill_url, codeHash);
+    if (existingApproval) {
+      console.log(`⚡ Auto-executing trusted code: ${codeHash.substring(0, 16)}...`);
+      db.updateRequestStatus(requestId, 'approved');
+      if (telegramBot) {
+        const messageId = await telegramBot.sendAutoApproveNotification(requestId, skill_id, metadata, codeHash);
+        db.updateRequestStatus(requestId, 'approved', messageId);
+      }
+      executeInBackground(requestId, code, metadata, secretsList);
+      return res.json({ request_id: requestId, status: 'approved', message: 'Auto-approved (trusted code)' });
     }
 
+    // Run structured analysis (needed for session policy check)
+    let analysis: CodeAnalysis | undefined;
+    if (process.env.ANTHROPIC_API_KEY) {
+      const cache = {
+        get: (h: string) => db.getAnalysis(h),
+        set: (h: string, a: CodeAnalysis) => db.setAnalysis(h, a)
+      };
+      analysis = await analyzeCode(code, metadata, codeHash, cache);
+    }
+
+    // Check session policy — auto-approve if skill fits within bounds
+    const session = db.getSession(sessionId);
+    if (session && analysis) {
+      const fits = skillFitsPolicy(analysis, session.policy);
+      if (fits) {
+        console.log(`⚡ Auto-approved via session ${sessionId}: ${skill_id}`);
+        db.touchSession(sessionId);
+        db.updateRequestStatus(requestId, 'approved');
+        if (telegramBot) {
+          const messageId = await telegramBot.sendSessionAutoApproveNotification(requestId, skill_id, metadata, codeHash, sessionId, analysis);
+          db.updateRequestStatus(requestId, 'approved', messageId);
+        }
+        executeInBackground(requestId, code, metadata, secretsList);
+        return res.json({ request_id: requestId, status: 'approved', session_id: sessionId, message: 'Auto-approved (session policy)' });
+      }
+    }
+
+    // Store session_id in request metadata for onApproval to create/expand session
+    pendingSessionIds.set(requestId, sessionId);
+    if (analysis) pendingAnalyses.set(requestId, analysis);
+
     if (telegramBot) {
-      const messageId = await telegramBot.sendApprovalRequest(requestId, skill_id, skill_url, metadata, codeHash, args, analysis);
+      const messageId = await telegramBot.sendApprovalRequest(requestId, skill_id, skill_url, metadata, codeHash, args, analysis?.summary);
       db.updateRequestStatus(requestId, 'pending', messageId);
     }
 
-    res.json({ request_id: requestId, status: 'pending', message: 'Awaiting approval' });
+    res.json({ request_id: requestId, status: 'pending', session_id: sessionId, message: 'Awaiting approval' });
   } catch (error: any) {
     console.error('Execute error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Get execution status
-app.get('/execute/:id/status', (req: Request, res: Response) => {
+// Waiters for long-poll: requestId -> resolver callbacks
+const statusWaiters = new Map<string, Array<() => void>>();
+
+function notifyStatusWaiters(requestId: string) {
+  const waiters = statusWaiters.get(requestId);
+  if (!waiters) return;
+  statusWaiters.delete(requestId);
+  for (const resolve of waiters) resolve();
+}
+
+// Get execution status — supports ?wait=true for long-poll (up to 120s)
+app.get('/execute/:id/status', async (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const request = db.getRequest(id);
   if (!request) return res.status(404).json({ error: 'Request not found' });
+
+  const wantWait = req.query.wait === 'true' || req.query.wait === '1';
+  const terminal = ['completed', 'failed', 'denied'];
+
+  // Long-poll: if status is not terminal, wait up to 120s for a change
+  if (wantWait && !terminal.includes(request.status)) {
+    await new Promise<void>(resolve => {
+      const timeout = setTimeout(resolve, 120_000);
+      const entry = () => { clearTimeout(timeout); resolve(); };
+      if (!statusWaiters.has(id)) statusWaiters.set(id, []);
+      statusWaiters.get(id)!.push(entry);
+    });
+    // Re-read after waking
+    const updated = db.getRequest(id);
+    if (updated) {
+      const response: any = { request_id: updated.id, status: updated.status, created_at: updated.created_at };
+      if (updated.approved_at) response.approved_at = updated.approved_at;
+      if (updated.executed_at) response.executed_at = updated.executed_at;
+      if (updated.result) response.result = JSON.parse(updated.result);
+      if (updated.error) response.error = updated.error;
+      return res.json(response);
+    }
+  }
 
   const response: any = { request_id: request.id, status: request.status, created_at: request.created_at };
   if (request.approved_at) response.approved_at = request.approved_at;
@@ -210,6 +333,7 @@ async function executeInBackground(requestId: string, code: string, metadata: an
       success: result.success, stdout: result.stdout,
       stderr: result.stderr, exitCode: result.exitCode, duration: result.duration
     }, result.success ? undefined : result.stderr);
+    notifyStatusWaiters(requestId);
 
     const request = db.getRequest(requestId);
     if (request?.telegram_message_id && telegramBot) {
@@ -220,6 +344,7 @@ async function executeInBackground(requestId: string, code: string, metadata: an
   } catch (error: any) {
     console.error(`❌ Execution failed for ${requestId}:`, error.message);
     db.updateRequestResult(requestId, null, error.message);
+    notifyStatusWaiters(requestId);
     try {
       const request = db.getRequest(requestId);
       if (request?.telegram_message_id && telegramBot) {

@@ -79,6 +79,13 @@ export class ProxyDatabase {
         created_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS sessions (
+        session_id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        last_activity INTEGER NOT NULL,
+        policy TEXT NOT NULL DEFAULT '{}'
+      );
+
       CREATE INDEX IF NOT EXISTS idx_requests_status ON execution_requests(status);
       CREATE INDEX IF NOT EXISTS idx_requests_created ON execution_requests(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_approvals_expires ON skill_approvals(expires_at);
@@ -231,19 +238,67 @@ export class ProxyDatabase {
 
   // Code analysis cache
 
-  getAnalysis(codeHash: string): { summary: string; timestamp: number } | undefined {
-    return this.db.prepare(
+  getAnalysis(codeHash: string): any | undefined {
+    const row = this.db.prepare(
       'SELECT summary, created_at as timestamp FROM code_analysis WHERE code_hash = ?'
     ).get(codeHash) as { summary: string; timestamp: number } | undefined;
+    if (!row) return undefined;
+    // Try parsing as structured JSON, fall back to legacy string format
+    try {
+      return JSON.parse(row.summary);
+    } catch {
+      return { summary: row.summary, timestamp: row.timestamp, secretsUsed: [], networkTargets: [], isMutating: true, riskLevel: 'medium' as const, concerns: [] };
+    }
   }
 
-  setAnalysis(codeHash: string, summary: string): void {
+  setAnalysis(codeHash: string, analysis: any): void {
+    const data = typeof analysis === 'string' ? analysis : JSON.stringify(analysis);
     this.db.prepare(
       'INSERT OR REPLACE INTO code_analysis (code_hash, summary, created_at) VALUES (?, ?, ?)'
-    ).run(codeHash, summary, Date.now());
+    ).run(codeHash, data, Date.now());
+  }
+
+  // Sessions
+
+  createSession(sessionId: string, policy: SessionPolicy): void {
+    const now = Date.now();
+    this.db.prepare(
+      'INSERT OR REPLACE INTO sessions (session_id, created_at, last_activity, policy) VALUES (?, ?, ?, ?)'
+    ).run(sessionId, now, now, JSON.stringify(policy));
+  }
+
+  getSession(sessionId: string): { session_id: string; created_at: number; last_activity: number; policy: SessionPolicy } | undefined {
+    const row = this.db.prepare('SELECT * FROM sessions WHERE session_id = ?').get(sessionId) as any;
+    if (!row) return undefined;
+    // Expire after 2 hours of inactivity
+    if (Date.now() - row.last_activity > 2 * 60 * 60 * 1000) {
+      this.db.prepare('DELETE FROM sessions WHERE session_id = ?').run(sessionId);
+      return undefined;
+    }
+    return { ...row, policy: JSON.parse(row.policy) };
+  }
+
+  touchSession(sessionId: string): void {
+    this.db.prepare('UPDATE sessions SET last_activity = ? WHERE session_id = ?').run(Date.now(), sessionId);
+  }
+
+  updateSessionPolicy(sessionId: string, policy: SessionPolicy): void {
+    this.db.prepare('UPDATE sessions SET policy = ?, last_activity = ? WHERE session_id = ?')
+      .run(JSON.stringify(policy), Date.now(), sessionId);
+  }
+
+  deleteSession(sessionId: string): void {
+    this.db.prepare('DELETE FROM sessions WHERE session_id = ?').run(sessionId);
   }
 
   close(): void {
     this.db.close();
   }
+}
+
+export interface SessionPolicy {
+  allowedSecrets: string[];
+  allowedNetworks: string[];
+  allowMutating: boolean;
+  maxRiskLevel: 'low' | 'medium' | 'high';
 }

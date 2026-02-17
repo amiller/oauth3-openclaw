@@ -3,7 +3,7 @@
  */
 
 import TelegramBot from 'node-telegram-bot-api';
-import { ProxyDatabase } from './database.js';
+import { ProxyDatabase, SessionPolicy } from './database.js';
 import { appendFile } from 'fs/promises';
 
 interface PendingApproval {
@@ -60,9 +60,10 @@ export class TelegramApprovalBot {
       const notif = `${timestamp} ${message}\n`;
       await appendFile('/tmp/oauth3-notifications.log', notif);
       
-      // Also try to POST to local notification endpoint (if available)
+      // POST to agent notification endpoint
+      const notifyUrl = process.env.AGENT_NOTIFY_URL || 'http://127.0.0.1:18790/notify';
       try {
-        const response = await fetch('http://127.0.0.1:18790/notify', {
+        const response = await fetch(notifyUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ message }),
@@ -279,6 +280,8 @@ export class TelegramApprovalBot {
         await this.handleSecretsMenu(msg);
       } else if (msg.text?.startsWith('/delete_secret ')) {
         await this.handleDeleteSecret(msg);
+      } else if (msg.text?.startsWith('/end_session')) {
+        await this.handleEndSession(msg);
       }
     });
   }
@@ -539,6 +542,74 @@ Hash: ${codeHash.substring(0, 16)}...`;
     }
 
     console.log(`📨 Requested secret ${secretName} for ${requestId}`);
+  }
+
+  async sendSessionStartNotification(sessionId: string, policy: SessionPolicy): Promise<void> {
+    const msg = `📋 Session started: ${sessionId.substring(0, 16)}...
+
+Auto-approving similar skills for 2h:
+• Secrets: ${policy.allowedSecrets.join(', ') || 'none'}
+• Network: ${policy.allowedNetworks.join(', ') || 'none'}
+• Mutating: ${policy.allowMutating ? 'yes' : 'no'}
+• Max risk: ${policy.maxRiskLevel}
+
+/end_session ${sessionId} to stop`;
+
+    await this.bot.sendMessage(this.chatId, msg, { disable_notification: true });
+  }
+
+  async sendSessionAutoApproveNotification(
+    requestId: string, skillId: string, metadata: any, codeHash: string,
+    sessionId: string, analysis: any
+  ): Promise<number> {
+    const msg = `⚡ Auto-approved (session)
+
+Skill: ${skillId}
+Hash: ${codeHash.substring(0, 16)}...
+Session: ${sessionId.substring(0, 16)}...
+Risk: ${analysis.riskLevel}
+
+${metadata.description || ''}`;
+
+    const sent = await this.bot.sendMessage(this.chatId, msg, {
+      disable_notification: true,
+      disable_web_page_preview: true
+    });
+    this.requestMessages.set(requestId, { messageId: sent.message_id, baseText: msg });
+    return sent.message_id;
+  }
+
+  private async handleEndSession(msg: TelegramBot.Message): Promise<void> {
+    const sessionId = (msg.text || '').split(' ')[1];
+    if (!sessionId) {
+      await this.bot.sendMessage(msg.chat.id, '❌ Usage: /end_session SESSION_ID');
+      return;
+    }
+    const session = this.db.getSession(sessionId);
+    if (!session) {
+      await this.bot.sendMessage(msg.chat.id, `❌ Session not found or expired: ${sessionId.substring(0, 16)}...`);
+      return;
+    }
+    this.db.deleteSession(sessionId);
+    await this.bot.sendMessage(msg.chat.id, `🛑 Session ended: ${sessionId.substring(0, 16)}...`);
+  }
+
+  async sendAutoApproveNotification(requestId: string, skillId: string, metadata: any, codeHash: string): Promise<number> {
+    const msg = `⚡ Auto-approved (trusted)
+
+Skill: ${skillId}
+Hash: ${codeHash.substring(0, 16)}...
+Secrets: ${metadata.secrets?.join(', ') || 'none'}
+Network: ${metadata.network?.join(', ') || 'none'}
+
+${metadata.description || ''}`;
+
+    const sent = await this.bot.sendMessage(this.chatId, msg, {
+      disable_notification: true,
+      disable_web_page_preview: true
+    });
+    this.requestMessages.set(requestId, { messageId: sent.message_id, baseText: msg });
+    return sent.message_id;
   }
 
   stop(): void {

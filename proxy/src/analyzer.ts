@@ -3,14 +3,27 @@ import { SkillMetadata } from './executor.js'
 
 const client = new Anthropic()
 
-const SYSTEM = `You are a security reviewer for Deno TypeScript skills that run in a sandboxed execution proxy. Analyze the submitted code and provide a brief assessment (3-5 lines max). Cover:
-1. What the code actually does (one sentence)
-2. Whether actual behavior matches the declared @description
-3. Whether actual network calls and secret usage match declared @secrets and @network
-4. Any security concerns (exfiltration, eval, unexpected side effects)`
+const SYSTEM = `You are a security reviewer for Deno TypeScript skills that run in a sandboxed execution proxy. Analyze the submitted code and return a JSON object with these fields:
+
+{
+  "summary": "1-2 sentence human-readable description of what the code does",
+  "secretsUsed": ["ENV_VAR_1", "ENV_VAR_2"],  // env vars actually read by the code (Deno.env.get, process.env, etc)
+  "networkTargets": ["api.example.com"],       // domains the code actually contacts
+  "isMutating": false,                          // true if code writes/deletes/modifies external state (POST/PUT/DELETE, file writes, DB mutations)
+  "riskLevel": "low",                           // "low" = read-only + declared scope, "medium" = mutations or broad network, "high" = eval/exfiltration/undeclared access
+  "concerns": []                                // short strings listing any security concerns, empty if none
+}
+
+Be precise about secretsUsed and networkTargets — only list what the code ACTUALLY uses, not what's declared in metadata.
+Return ONLY the JSON object, no markdown fences or explanation.`
 
 export interface CodeAnalysis {
   summary: string
+  secretsUsed: string[]
+  networkTargets: string[]
+  isMutating: boolean
+  riskLevel: 'low' | 'medium' | 'high'
+  concerns: string[]
   timestamp: number
 }
 
@@ -40,8 +53,24 @@ ${code}
 \`\`\`` }]
   })
 
-  const summary = msg.content[0].type === 'text' ? msg.content[0].text : '(no analysis)'
-  const analysis: CodeAnalysis = { summary, timestamp: Date.now() }
+  const text = msg.content[0].type === 'text' ? msg.content[0].text : '{}'
+  let parsed: any
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    // Fallback if Haiku doesn't return clean JSON
+    parsed = { summary: text, secretsUsed: [], networkTargets: [], isMutating: true, riskLevel: 'medium', concerns: ['Could not parse structured analysis'] }
+  }
+
+  const analysis: CodeAnalysis = {
+    summary: parsed.summary || '(no summary)',
+    secretsUsed: parsed.secretsUsed || [],
+    networkTargets: parsed.networkTargets || [],
+    isMutating: parsed.isMutating ?? true,
+    riskLevel: parsed.riskLevel || 'medium',
+    concerns: parsed.concerns || [],
+    timestamp: Date.now()
+  }
   cache.set(codeHash, analysis)
   return analysis
 }
