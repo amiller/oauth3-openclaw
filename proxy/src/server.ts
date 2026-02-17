@@ -145,7 +145,9 @@ Human approval gates execution — or session policies auto-approve within learn
 
 1. **Submit code** via \`POST /execute\`
 2. **Poll for result** via \`GET /execute/:id/status?wait=true\` (long-polls up to 120s)
-3. If status is \`pending\`, the \`approval_url\` in the response needs human approval first
+   - The response includes \`status_url\` — call it with your bearer token to block until completion
+   - IMPORTANT: Always long-poll after submitting. Don't wait for the user to tell you it was approved.
+3. If status is \`pending\`, share the \`approval_url\` with the user (use markdown link formatting)
 4. Result arrives in \`result.stdout\` — return all output as text/JSON on stdout
 
 ## Endpoints
@@ -665,7 +667,8 @@ app.post('/scope', requireAuth, async (req: Request, res: Response) => {
     });
 
     const approvalUrl = PUBLIC_URL ? `${PUBLIC_URL}/approve/${requestId}?token=${approvalToken}` : undefined;
-    res.json({ request_id: requestId, status: 'pending_scope', session_id: sessionId, approval_url: approvalUrl, message: 'Scope request awaiting approval' });
+    const statusUrl = PUBLIC_URL ? `${PUBLIC_URL}/execute/${requestId}/status?wait=true` : undefined;
+    res.json({ request_id: requestId, status: 'pending_scope', session_id: sessionId, approval_url: approvalUrl, status_url: statusUrl, message: 'Scope request awaiting approval — poll status_url to be notified when approved' });
   } catch (error: any) {
     console.error('Scope request error:', error);
     res.status(500).json({ error: error.message });
@@ -773,7 +776,8 @@ app.post('/execute', requireAuth, async (req: Request, res: Response) => {
       db.updateRequestStatus(requestId, 'pending', messageId);
     }
 
-    res.json({ request_id: requestId, status: 'pending', session_id: sessionId, approval_url: approvalUrl, message: 'Awaiting approval' });
+    const statusUrl = PUBLIC_URL ? `${PUBLIC_URL}/execute/${requestId}/status?wait=true` : undefined;
+    res.json({ request_id: requestId, status: 'pending', session_id: sessionId, approval_url: approvalUrl, status_url: statusUrl, message: 'Awaiting approval — poll status_url to be notified when approved' });
   } catch (error: any) {
     console.error('Execute error:', error);
     res.status(500).json({ error: error.message });
