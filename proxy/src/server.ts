@@ -6,7 +6,7 @@ import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import { ProxyDatabase, SessionPolicy } from './database.js';
 import { executeSkill, hashCode, parseMetadata, EXECUTOR_MODE } from './executor.js';
-import { analyzeCode, CodeAnalysis } from './analyzer.js';
+import { analyzeCode, CodeAnalysis, checkPolicyCompliance } from './analyzer.js';
 import { randomBytes } from 'crypto';
 
 const app = express();
@@ -33,19 +33,26 @@ console.log(`🔑 Loaded ${Object.keys(secrets).length} secrets from database`);
 // Session tracking for pending requests
 const pendingSessionIds = new Map<string, string>();   // requestId -> sessionId
 const pendingAnalyses = new Map<string, CodeAnalysis>(); // requestId -> analysis
+const pendingScopeRequests = new Map<string, {
+  sessionId: string; description: string; constraints: string[];
+  secrets: string[]; networks: string[];
+}>();
 
 const RISK_LEVELS = { low: 0, medium: 1, high: 2 } as const;
 
-function skillFitsPolicy(analysis: CodeAnalysis, policy: SessionPolicy): boolean {
-  // All secrets used must be in the allowed set
+function structuralPolicyCheck(analysis: CodeAnalysis, policy: SessionPolicy): boolean {
   if (analysis.secretsUsed.some(s => !policy.allowedSecrets.includes(s))) return false;
-  // All network targets must be in the allowed set
   if (analysis.networkTargets.some(n => !policy.allowedNetworks.includes(n))) return false;
-  // Mutating only if policy allows
   if (analysis.isMutating && !policy.allowMutating) return false;
-  // Risk level must not exceed policy
   if (RISK_LEVELS[analysis.riskLevel] > RISK_LEVELS[policy.maxRiskLevel]) return false;
   return true;
+}
+
+async function skillFitsPolicy(code: string, metadata: any, analysis: CodeAnalysis, policy: SessionPolicy): Promise<{ fits: boolean; violations?: string[] }> {
+  if (!structuralPolicyCheck(analysis, policy)) return { fits: false };
+  if (!policy.constraints?.length) return { fits: true };
+  const compliance = await checkPolicyCompliance(code, metadata, policy.constraints);
+  return { fits: compliance.compliant, violations: compliance.violations };
 }
 
 function policyFromAnalysis(analysis: CodeAnalysis): SessionPolicy {
@@ -170,6 +177,25 @@ Response: \`{ request_id, status, result, error }\`
 - \`result.exitCode\` — 0 on success
 - \`result.duration\` — ms
 
+### POST /scope — request a scope (session with constraints)
+\`\`\`json
+{
+  "description": "GitHub access for owockibot bounty",
+  "constraints": [
+    "Only create or modify repositories under the owockibot organization",
+    "Maximum 2 new repository creations",
+    "No destructive actions: no repo deletion, force push, or branch deletion"
+  ],
+  "secrets": ["GH_TOKEN"],
+  "networks": ["api.github.com"],
+  "session_id": "optional-reuse-existing"
+}
+\`\`\`
+Returns \`{ request_id, status: "pending_scope", session_id, approval_url }\`.
+Human approves the scope at the URL. Once approved, a session is created with
+those constraints. Subsequent \`/execute\` calls with the same \`session_id\` are
+auto-approved if they pass both structural checks AND Haiku constraint review.
+
 ### POST /execute with dry_run
 Same body as above, add \`"dry_run": true\`. Returns what *would* happen without creating a request:
 \`\`\`json
@@ -216,9 +242,13 @@ Max output: ~1MB. stderr is captured separately for diagnostics.
 
 ## Sessions & Auto-Approval
 
-Pass \`session_id\` to group related requests. After the first manual approval,
-the proxy learns a policy (allowed secrets, networks, mutation flag, risk level).
-Subsequent requests that fit within the policy auto-approve for 2 hours.
+Pass \`session_id\` to group related requests. Two ways to create a session:
+
+1. **Implicit** — first manual approval creates a session policy from Haiku analysis
+2. **Explicit** — \`POST /scope\` to request a session with specific constraints upfront
+
+Subsequent requests that fit within the policy auto-approve (structural check +
+Haiku constraint review). Sessions expire after 2h of inactivity.
 
 Trusted code (approved with "Trust Code") auto-executes forever by code hash.
 
@@ -273,12 +303,12 @@ a{color:#89b4fa;text-decoration:none} a:hover{text-decoration:underline}
 ${sessions.length === 0 ? '<p class="empty">No active sessions</p>' : `<table>
 <tr><th>Session</th><th>Age</th><th>Idle</th><th>Secrets</th><th>Networks</th><th>Risk</th><th></th></tr>
 ${sessions.map(s => `<tr>
-<td><code>${esc(s.session_id.substring(0, 20))}</code></td>
+<td><code>${esc(s.session_id.substring(0, 20))}</code>${s.policy.description ? `<br><small>${esc(s.policy.description.substring(0, 60))}</small>` : ''}</td>
 <td>${ago(s.created_at)}</td>
 <td>${ago(s.last_activity)}</td>
 <td>${s.policy.allowedSecrets.map((x: string) => `<span class="tag secret">${esc(x)}</span>`).join(' ') || '—'}</td>
 <td>${s.policy.allowedNetworks.map((x: string) => `<span class="tag network">${esc(x)}</span>`).join(' ') || '—'}</td>
-<td class="risk-${s.policy.maxRiskLevel}">${s.policy.maxRiskLevel}</td>
+<td class="risk-${s.policy.maxRiskLevel}">${s.policy.maxRiskLevel}${s.policy.constraints?.length ? `<br><small>${s.policy.constraints.length} constraints</small>` : ''}</td>
 <td><form method="POST" action="/dashboard/revoke?token=${esc(API_BEARER_TOKEN)}" style="display:inline">
 <input type="hidden" name="session_id" value="${esc(s.session_id)}">
 <button class="btn" type="submit">revoke</button></form></td>
@@ -408,9 +438,51 @@ app.get('/approve/:id', (req: Request, res: Response) => {
   if (!request) return res.status(404).send('Not found');
   if (!token || token !== request.approval_token) return res.status(403).send('Invalid token');
 
+  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  // Scope request approval page
+  const scopeReq = pendingScopeRequests.get(id);
+  if (scopeReq && request.status === 'pending') {
+    return res.type('html').send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Approve Scope</title>
+<style>
+body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;margin:0;padding:1.5em;max-width:700px;margin:0 auto}
+h1{color:#89b4fa;font-size:1.2em} .meta{color:#6c7086;margin-bottom:1em}
+.constraint{background:#181825;padding:0.6em 1em;border-radius:6px;border-left:3px solid #f9e2af;margin:0.4em 0}
+.section{margin:1em 0} .section b{color:#a6adc8}
+.actions{margin:1.5em 0;display:flex;gap:0.5em;flex-wrap:wrap}
+button{font-family:monospace;font-size:1em;padding:0.6em 1.2em;border:none;border-radius:6px;cursor:pointer}
+.approve{background:#a6e3a1;color:#1e1e2e} .deny{background:#f38ba8;color:#1e1e2e}
+.tag{display:inline-block;padding:0.15em 0.5em;border-radius:4px;font-size:0.85em;margin:0.1em}
+.secret{background:#f38ba820;color:#f38ba8} .network{background:#89b4fa20;color:#89b4fa}
+</style></head><body>
+<h1>🔐 Scope Request</h1>
+<div class="section"><b>Description:</b><br>${esc(scopeReq.description)}</div>
+<div class="section"><b>Secrets:</b> ${scopeReq.secrets.map(s => `<span class="tag secret">${esc(s)}</span>`).join(' ') || 'none'}</div>
+<div class="section"><b>Networks:</b> ${scopeReq.networks.map(n => `<span class="tag network">${esc(n)}</span>`).join(' ') || 'none'}</div>
+<div class="section"><b>Constraints:</b>
+${scopeReq.constraints.map(c => `<div class="constraint">${esc(c)}</div>`).join('')}
+${!scopeReq.constraints.length ? '<div class="meta">No constraints specified</div>' : ''}
+</div>
+<div class="actions">
+<form method="POST" style="display:inline">
+  <input type="hidden" name="token" value="${esc(token)}">
+  <input type="hidden" name="action" value="approve">
+  <input type="hidden" name="level" value="scope">
+  <button type="submit" class="approve">✅ Approve Scope</button>
+</form>
+<form method="POST" style="display:inline">
+  <input type="hidden" name="token" value="${esc(token)}">
+  <input type="hidden" name="action" value="deny">
+  <button type="submit" class="deny">❌ Deny</button>
+</form>
+</div>
+</body></html>`);
+  }
+
   const code = db.getCode(id) || '';
   const metadata = parseMetadata(code);
-  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const analysisData = db.getAnalysis(request.code_hash);
   const analysisSummary = analysisData?.summary || '';
 
@@ -501,7 +573,34 @@ app.post('/approve/:id', async (req: Request, res: Response) => {
 </head><body><h2>❌ Denied</h2><p>Request ${esc(id)} was denied.</p></body></html>`);
   }
 
-  // Approve
+  // Scope request approval — create session with constraints
+  const scopeReq = pendingScopeRequests.get(id);
+  if (scopeReq) {
+    const policy: SessionPolicy = {
+      allowedSecrets: scopeReq.secrets,
+      allowedNetworks: scopeReq.networks,
+      allowMutating: true,
+      maxRiskLevel: 'medium',
+      constraints: scopeReq.constraints,
+      description: scopeReq.description
+    };
+    db.createSession(scopeReq.sessionId, policy);
+    db.updateRequestStatus(id, 'completed');
+    pendingScopeRequests.delete(id);
+    notifyStatusWaiters(id);
+    console.log(`📋 Scope approved, session ${scopeReq.sessionId} created with ${scopeReq.constraints.length} constraints`);
+    return res.type('html').send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<style>body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;padding:2em;text-align:center}
+a{color:#89b4fa}</style>
+</head><body><h2>✅ Scope Approved</h2>
+<p>Session <code>${esc(scopeReq.sessionId)}</code> created.</p>
+<p>${scopeReq.constraints.length} constraints active.</p>
+<p><a href="/dashboard?token=${esc(API_BEARER_TOKEN)}">View Dashboard</a></p>
+</body></html>`);
+  }
+
+  // Approve code execution
   const approvalLevel = (level as 'once' | 'trust_code') || 'once';
   if (approvalLevel === 'trust_code') {
     db.addApproval(request.skill_url, request.code_hash, 'forever');
@@ -540,6 +639,37 @@ a{color:#89b4fa}</style>
 <p><a href="/approve/${esc(id)}?token=${esc(token)}">View status</a></p>
 <script>setTimeout(()=>location.reload(),3000)</script>
 </body></html>`);
+});
+
+// Request scope (creates session with constraints, pending human approval)
+app.post('/scope', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { session_id: clientSessionId, description, constraints, secrets: requestedSecrets, networks } = req.body;
+    if (!description) return res.status(400).json({ error: 'Missing description' });
+    const sessionId = clientSessionId || `session_${randomBytes(8).toString('hex')}`;
+    const secretsList = Array.isArray(requestedSecrets) ? requestedSecrets : [];
+    const networksList = Array.isArray(networks) ? networks : [];
+    const constraintsList = Array.isArray(constraints) ? constraints : [];
+
+    const requestId = `scope_${randomBytes(8).toString('hex')}`;
+    const approvalToken = randomBytes(32).toString('hex');
+    const scopeData = JSON.stringify({ description, constraints: constraintsList, secrets: secretsList, networks: networksList });
+
+    db.createRequest(requestId, 'scope-request', 'scope', hashCode(scopeData), secretsList, { description, constraints: constraintsList, networks: networksList }, approvalToken);
+    db.storeCode(requestId, scopeData);
+
+    // Store pending scope for approval handler
+    pendingScopeRequests.set(requestId, {
+      sessionId, description, constraints: constraintsList,
+      secrets: secretsList, networks: networksList
+    });
+
+    const approvalUrl = PUBLIC_URL ? `${PUBLIC_URL}/approve/${requestId}?token=${approvalToken}` : undefined;
+    res.json({ request_id: requestId, status: 'pending_scope', session_id: sessionId, approval_url: approvalUrl, message: 'Scope request awaiting approval' });
+  } catch (error: any) {
+    console.error('Scope request error:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Request execution (supports dry_run: true to check without executing)
@@ -589,10 +719,10 @@ app.post('/execute', requireAuth, async (req: Request, res: Response) => {
       analysis = await analyzeCode(code, metadata, codeHash, cache);
     }
 
-    // Check session policy
+    // Check session policy (structural + Haiku constraint check)
     const session = db.getSession(sessionId);
     if (session && analysis) {
-      const fits = skillFitsPolicy(analysis, session.policy);
+      const { fits, violations } = await skillFitsPolicy(code, metadata, analysis, session.policy);
       if (fits) {
         if (dry_run) return res.json({ dry_run: true, would_auto_approve: true, reason: 'session_policy', session_id: sessionId, analysis });
         console.log(`⚡ Auto-approved via session ${sessionId}: ${skill_id}`);
@@ -605,6 +735,7 @@ app.post('/execute', requireAuth, async (req: Request, res: Response) => {
         executeInBackground(requestId, code, metadata, secretsList);
         return res.json({ request_id: requestId, status: 'approved', session_id: sessionId, message: 'Auto-approved (session policy)' });
       }
+      if (violations?.length) console.log(`🚫 Policy violations for ${skill_id}:`, violations);
     }
 
     // Would need human approval

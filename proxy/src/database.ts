@@ -317,4 +317,6 @@ export interface SessionPolicy {
   allowedNetworks: string[];
   allowMutating: boolean;
   maxRiskLevel: 'low' | 'medium' | 'high';
+  constraints?: string[];
+  description?: string;
 }

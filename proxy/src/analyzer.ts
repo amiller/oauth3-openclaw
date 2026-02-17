@@ -74,3 +74,47 @@ ${code}
   cache.set(codeHash, analysis)
   return analysis
 }
+
+export interface PolicyCompliance {
+  compliant: boolean
+  violations: string[]
+}
+
+const COMPLIANCE_SYSTEM = `You are a policy compliance checker for sandboxed code execution. You will be given code and a list of policy constraints. Determine if the code complies with ALL constraints.
+
+Return ONLY a JSON object:
+{
+  "compliant": true/false,
+  "violations": ["constraint text that was violated — and why"]
+}
+
+Be strict but fair. If the code COULD violate a constraint depending on runtime values, flag it. If the code clearly stays within bounds, mark compliant. Return ONLY JSON, no markdown fences.`
+
+export async function checkPolicyCompliance(
+  code: string, metadata: SkillMetadata, constraints: string[]
+): Promise<PolicyCompliance> {
+  if (!constraints.length) return { compliant: true, violations: [] }
+
+  const msg = await client.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 512,
+    system: COMPLIANCE_SYSTEM,
+    messages: [{ role: 'user', content: `Skill: ${metadata.skill}
+Description: ${metadata.description}
+
+Policy constraints:
+${constraints.map((c, i) => `${i + 1}. ${c}`).join('\n')}
+
+\`\`\`typescript
+${code}
+\`\`\`` }]
+  })
+
+  const text = msg.content[0].type === 'text' ? msg.content[0].text : '{}'
+  try {
+    const parsed = JSON.parse(text)
+    return { compliant: !!parsed.compliant, violations: parsed.violations || [] }
+  } catch {
+    return { compliant: false, violations: ['Could not parse compliance check — treating as non-compliant'] }
+  }
+}
