@@ -303,6 +303,10 @@ export class ProxyDatabase {
     return rows.map(r => ({ ...r, policy: JSON.parse(r.policy) }));
   }
 
+  listRecentRequests(limit = 20): ExecutionRecord[] {
+    return this.db.prepare('SELECT * FROM execution_requests ORDER BY created_at DESC LIMIT ?').all(limit) as ExecutionRecord[];
+  }
+
   close(): void {
     this.db.close();
   }

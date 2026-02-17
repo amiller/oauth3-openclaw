@@ -222,6 +222,12 @@ Subsequent requests that fit within the policy auto-approve for 2 hours.
 
 Trusted code (approved with "Trust Code") auto-executes forever by code hash.
 
+## Presenting Links to Users
+
+When sharing URLs with users (e.g. via Telegram), use markdown link formatting:
+\`[Approve: task-name](https://long-url...)\` instead of raw URLs.
+The approval_url and dashboard are long — always wrap them in descriptive link text.
+
 ## Available Secrets
 ${Object.keys(secrets).map(s => '- ' + s).join('\n') || '(none configured)'}
 
@@ -231,14 +237,76 @@ Executor: ${EXECUTOR_MODE} mode
 `);
 });
 
-// Health check
-app.get('/health', (req: Request, res: Response) => {
-  res.json({
-    status: 'ok',
-    telegram_configured: !!TELEGRAM_BOT_TOKEN,
-    public_url: PUBLIC_URL || null,
-    timestamp: Date.now()
-  });
+// Dashboard — human-facing session/execution browser
+app.get('/dashboard', (req: Request, res: Response) => {
+  if (API_BEARER_TOKEN && req.query.token !== API_BEARER_TOKEN) return res.status(401).send('Unauthorized — append ?token=...');
+  const sessions = db.listSessions();
+  const requests = db.listRecentRequests(30);
+  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const ago = (ts: number) => {
+    const m = Math.round((Date.now() - ts) / 60000);
+    return m < 60 ? `${m}m ago` : `${Math.round(m / 60)}h ago`;
+  };
+  const statusIcon: Record<string, string> = { completed: '✅', failed: '❌', denied: '🚫', pending: '⏳', approved: '🔄', executing: '⚙️', awaiting_secrets: '🔑' };
+
+  res.type('html').send(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>OAuth3 Dashboard</title>
+<style>
+body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;margin:0;padding:1.5em;max-width:900px;margin:0 auto}
+h1{color:#89b4fa;font-size:1.3em} h2{color:#a6adc8;font-size:1.1em;margin-top:2em}
+table{width:100%;border-collapse:collapse;font-size:0.85em}
+th{text-align:left;color:#6c7086;border-bottom:1px solid #313244;padding:0.4em 0.6em}
+td{padding:0.4em 0.6em;border-bottom:1px solid #181825}
+tr:hover{background:#181825}
+.tag{display:inline-block;padding:0.15em 0.5em;border-radius:4px;font-size:0.8em}
+.secret{background:#f38ba820;color:#f38ba8} .network{background:#89b4fa20;color:#89b4fa}
+.risk-low{color:#a6e3a1} .risk-medium{color:#f9e2af} .risk-high{color:#f38ba8}
+a{color:#89b4fa;text-decoration:none} a:hover{text-decoration:underline}
+.btn{font-family:monospace;font-size:0.8em;padding:0.3em 0.6em;border:1px solid #f38ba8;color:#f38ba8;background:none;border-radius:4px;cursor:pointer}
+.btn:hover{background:#f38ba820}
+.empty{color:#6c7086;font-style:italic}
+</style></head><body>
+<h1>OAuth3 Dashboard</h1>
+
+<h2>Active Sessions (${sessions.length})</h2>
+${sessions.length === 0 ? '<p class="empty">No active sessions</p>' : `<table>
+<tr><th>Session</th><th>Age</th><th>Idle</th><th>Secrets</th><th>Networks</th><th>Risk</th><th></th></tr>
+${sessions.map(s => `<tr>
+<td><code>${esc(s.session_id.substring(0, 20))}</code></td>
+<td>${ago(s.created_at)}</td>
+<td>${ago(s.last_activity)}</td>
+<td>${s.policy.allowedSecrets.map((x: string) => `<span class="tag secret">${esc(x)}</span>`).join(' ') || '—'}</td>
+<td>${s.policy.allowedNetworks.map((x: string) => `<span class="tag network">${esc(x)}</span>`).join(' ') || '—'}</td>
+<td class="risk-${s.policy.maxRiskLevel}">${s.policy.maxRiskLevel}</td>
+<td><form method="POST" action="/dashboard/revoke?token=${esc(API_BEARER_TOKEN)}" style="display:inline">
+<input type="hidden" name="session_id" value="${esc(s.session_id)}">
+<button class="btn" type="submit">revoke</button></form></td>
+</tr>`).join('')}
+</table>`}
+
+<h2>Recent Executions</h2>
+${requests.length === 0 ? '<p class="empty">No executions yet</p>' : `<table>
+<tr><th>ID</th><th>Skill</th><th>Status</th><th>When</th><th></th></tr>
+${requests.map(r => `<tr>
+<td><code>${esc(r.id.substring(0, 16))}</code></td>
+<td>${esc(r.skill_id)}</td>
+<td>${statusIcon[r.status] || '?'} ${esc(r.status)}</td>
+<td>${ago(r.created_at)}</td>
+<td>${r.code_hash ? `<a href="/view/${esc(r.id)}?token=${esc(API_BEARER_TOKEN)}">code</a>` : ''}</td>
+</tr>`).join('')}
+</table>`}
+
+<p style="color:#6c7086;margin-top:2em;font-size:0.8em">Sessions expire after 2h of inactivity. <a href="/dashboard?token=${esc(API_BEARER_TOKEN)}">Refresh</a></p>
+</body></html>`);
+});
+
+// Dashboard revoke action
+app.post('/dashboard/revoke', (req: Request, res: Response) => {
+  if (API_BEARER_TOKEN && req.query.token !== API_BEARER_TOKEN) return res.status(401).send('Unauthorized');
+  const { session_id } = req.body;
+  if (session_id) db.deleteSession(session_id);
+  res.redirect(`/dashboard?token=${API_BEARER_TOKEN}`);
 });
 
 // Add secret — persists to SQLite
@@ -302,8 +370,11 @@ app.delete('/sessions/:id', requireAuth, (req: Request, res: Response) => {
   res.json({ deleted: true, session_id: id });
 });
 
-// View code for an execution request
-app.get('/view/:id', requireAuth, (req: Request, res: Response) => {
+// View code for an execution request (accepts bearer header or ?token= query param)
+app.get('/view/:id', (req: Request, res: Response, next: Function) => {
+  if (API_BEARER_TOKEN && req.query.token === API_BEARER_TOKEN) return next();
+  requireAuth(req, res, next);
+}, (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const code = db.getCode(id);
   if (!code) return res.status(404).send('Not found');
