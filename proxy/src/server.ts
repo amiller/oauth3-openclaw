@@ -321,14 +321,19 @@ a{color:#89b4fa}</style>
 // Request execution
 app.post('/execute', async (req: Request, res: Response) => {
   try {
-    const { skill_id, skill_url, secrets: requiredSecrets, args, session_id: clientSessionId } = req.body;
-    if (!skill_id || !skill_url) return res.status(400).json({ error: 'Missing skill_id or skill_url' });
+    const { skill_id, skill_url, skill_code, secrets: requiredSecrets, args, session_id: clientSessionId } = req.body;
+    if (!skill_id) return res.status(400).json({ error: 'Missing skill_id' });
+    if (!skill_url && !skill_code) return res.status(400).json({ error: 'Missing skill_url or skill_code' });
     const sessionId = clientSessionId || `session_${randomBytes(8).toString('hex')}`;
 
-    const codeResponse = await fetch(skill_url);
-    if (!codeResponse.ok) return res.status(400).json({ error: 'Failed to fetch skill code' });
-
-    const code = await codeResponse.text();
+    let code: string;
+    if (skill_code) {
+      code = skill_code;
+    } else {
+      const codeResponse = await fetch(skill_url);
+      if (!codeResponse.ok) return res.status(400).json({ error: 'Failed to fetch skill code' });
+      code = await codeResponse.text();
+    }
     const codeHash = hashCode(code);
     const metadata = parseMetadata(code);
     if (!metadata) return res.status(400).json({ error: 'Invalid skill format - missing metadata' });
