@@ -16,12 +16,14 @@ services:
       REDPILL_API_KEY: ${REDPILL_API_KEY:-}
       ANTHROPIC_OAUTH_TOKEN: ${ANTHROPIC_OAUTH_TOKEN:-}
       TELEGRAM_BOT_TOKEN: ${OPENCLAW_TELEGRAM_BOT_TOKEN:-}
+      OAUTH3_PROXY_URL: http://oauth3-proxy:3737
+      OAUTH3_BEARER_TOKEN: ${API_BEARER_TOKEN:-}
     restart: unless-stopped
     networks:
       - internal
 
   oauth3-proxy:
-    image: ghcr.io/amiller/oauth3-proxy@sha256:5ba1dd3bd6126c564c64d08c3929eba0d151a1f3aadee1ab4f14c48f5c1eb226
+    image: ghcr.io/amiller/oauth3-proxy@sha256:00fb049f177a182cbf85a56a669da22f4abf060269194c886c87a17d33eb12af
     container_name: oauth3-proxy
     ports:
       - "3737:3737"
@@ -34,6 +36,7 @@ services:
       PUBLIC_URL: https://b50173318c7332d2a7e63e66770d11b2b6e67043-3737.dstack-pha-prod7.phala.network
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       AGENT_NOTIFY_URL: http://openclaw:18790/notify
+      API_BEARER_TOKEN: ${API_BEARER_TOKEN:-}
     volumes:
       - oauth3_data:/data
     restart: unless-stopped

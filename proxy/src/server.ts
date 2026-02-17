@@ -19,6 +19,7 @@ const DB_PATH = process.env.DB_PATH || './proxy.db';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const PUBLIC_URL = process.env.PUBLIC_URL || '';
+const API_BEARER_TOKEN = process.env.API_BEARER_TOKEN || '';
 
 // Initialize database
 const db = new ProxyDatabase(DB_PATH);
@@ -241,7 +242,7 @@ app.get('/health', (req: Request, res: Response) => {
 });
 
 // Add secret — persists to SQLite
-app.post('/secrets', (req: Request, res: Response) => {
+app.post('/secrets', requireAuth, (req: Request, res: Response) => {
   const { name, value } = req.body;
   if (!name || !value) return res.status(400).json({ error: 'Missing name or value' });
   secrets[name] = value;
@@ -250,12 +251,20 @@ app.post('/secrets', (req: Request, res: Response) => {
 });
 
 // List secrets (names only)
-app.get('/secrets', (req: Request, res: Response) => {
+app.get('/secrets', requireAuth, (req: Request, res: Response) => {
   res.json({ secrets: Object.keys(secrets) });
 });
 
+// Bearer token auth for internal endpoints
+function requireAuth(req: Request, res: Response, next: Function) {
+  if (!API_BEARER_TOKEN) return next(); // no token configured = open access (dev mode)
+  const auth = req.headers.authorization;
+  if (auth === `Bearer ${API_BEARER_TOKEN}`) return next();
+  res.status(401).json({ error: 'Unauthorized' });
+}
+
 // List active sessions
-app.get('/sessions', (req: Request, res: Response) => {
+app.get('/sessions', requireAuth, (req: Request, res: Response) => {
   const sessions = db.listSessions();
   res.json({
     sessions: sessions.map(s => ({
@@ -270,7 +279,7 @@ app.get('/sessions', (req: Request, res: Response) => {
 });
 
 // Get single session
-app.get('/sessions/:id', (req: Request, res: Response) => {
+app.get('/sessions/:id', requireAuth, (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const session = db.getSession(id);
   if (!session) return res.status(404).json({ error: 'Session not found or expired' });
@@ -285,7 +294,7 @@ app.get('/sessions/:id', (req: Request, res: Response) => {
 });
 
 // Revoke session
-app.delete('/sessions/:id', (req: Request, res: Response) => {
+app.delete('/sessions/:id', requireAuth, (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const session = db.getSession(id);
   if (!session) return res.status(404).json({ error: 'Session not found or expired' });
@@ -294,7 +303,7 @@ app.delete('/sessions/:id', (req: Request, res: Response) => {
 });
 
 // View code for an execution request
-app.get('/view/:id', (req: Request, res: Response) => {
+app.get('/view/:id', requireAuth, (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const code = db.getCode(id);
   if (!code) return res.status(404).send('Not found');
@@ -463,7 +472,7 @@ a{color:#89b4fa}</style>
 });
 
 // Request execution (supports dry_run: true to check without executing)
-app.post('/execute', async (req: Request, res: Response) => {
+app.post('/execute', requireAuth, async (req: Request, res: Response) => {
   try {
     const { skill_id, skill_url, skill_code, secrets: requiredSecrets, args, session_id: clientSessionId, dry_run } = req.body;
     if (!skill_id) return res.status(400).json({ error: 'Missing skill_id' });
@@ -580,7 +589,7 @@ function notifyStatusWaiters(requestId: string) {
 }
 
 // Get execution status — supports ?wait=true for long-poll (up to 120s)
-app.get('/execute/:id/status', async (req: Request, res: Response) => {
+app.get('/execute/:id/status', requireAuth, async (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const request = db.getRequest(id);
   if (!request) return res.status(404).json({ error: 'Request not found' });
