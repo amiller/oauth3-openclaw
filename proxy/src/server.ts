@@ -20,6 +20,7 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const PUBLIC_URL = process.env.PUBLIC_URL || '';
 const API_BEARER_TOKEN = process.env.API_BEARER_TOKEN || '';
+const AGENT_NOTIFY_URL = process.env.AGENT_NOTIFY_URL || '';
 
 // Initialize database
 const db = new ProxyDatabase(DB_PATH);
@@ -84,7 +85,9 @@ function mergePolicy(existing: SessionPolicy, analysis: CodeAnalysis): SessionPo
     allowedSecrets: [...new Set([...existing.allowedSecrets, ...analysis.secretsUsed])],
     allowedNetworks: [...new Set([...existing.allowedNetworks, ...analysis.networkTargets])],
     allowMutating: existing.allowMutating || analysis.isMutating,
-    maxRiskLevel: RISK_LEVELS[analysis.riskLevel] > RISK_LEVELS[existing.maxRiskLevel] ? analysis.riskLevel : existing.maxRiskLevel
+    maxRiskLevel: RISK_LEVELS[analysis.riskLevel] > RISK_LEVELS[existing.maxRiskLevel] ? analysis.riskLevel : existing.maxRiskLevel,
+    constraints: existing.constraints,
+    description: existing.description
   };
 }
 
@@ -159,11 +162,22 @@ Human approval gates execution — or session policies auto-approve within learn
 ## Quick Start
 
 1. **Submit code** via \`POST /execute\`
-2. **Poll for result** via \`GET /execute/:id/status?wait=true\` (long-polls up to 120s)
-   - The response includes \`status_url\` — call it with your bearer token to block until completion
-   - IMPORTANT: Always long-poll after submitting. Don't wait for the user to tell you it was approved.
-3. If status is \`pending\`, share the \`approval_url\` with the user (use markdown link formatting)
-4. Result arrives in \`result.stdout\` — return all output as text/JSON on stdout
+2. If status is \`pending\`, share the \`approval_url\` with the user (use markdown link formatting)
+3. **IMMEDIATELY long-poll** \`GET /execute/:id/status?wait=true\` — this blocks up to 120s and returns when the request is approved+executed or denied. You MUST call this right after submitting. Do NOT wait for the user to tell you it was approved. The server will push-notify you AND the long-poll will unblock.
+4. If the long-poll times out (120s), re-poll. Loop until you get a terminal status.
+5. Result arrives in \`result.stdout\`
+
+## ⚠️ Critical: Always Long-Poll
+
+Every response includes a \`status_url\`. You MUST fetch it immediately after receiving a \`pending\` or \`pending_scope\` status. Example flow:
+
+\`\`\`
+POST /execute -> { status: "pending", status_url: "...status?wait=true", approval_url: "..." }
+# Show approval_url to user, AND SIMULTANEOUSLY:
+GET /execute/:id/status?wait=true -> blocks until approved+executed -> { status: "completed", result: {...} }
+\`\`\`
+
+Do NOT treat pending as "done, wait for user to tell me." Treat it as "show the link, then immediately block on status_url."
 
 ## Endpoints
 
@@ -788,6 +802,7 @@ app.post('/execute', requireAuth, async (req: Request, res: Response) => {
     }
 
     // Check session policy (structural + Haiku constraint check)
+    let policyViolations: string[] | undefined;
     const session = db.getSession(sessionId);
     if (session && analysis) {
       console.log(`📋 Checking session ${sessionId}: secrets=${JSON.stringify(session.policy.allowedSecrets)} networks=${JSON.stringify(session.policy.allowedNetworks)} constraints=${session.policy.constraints?.length || 0}`);
@@ -805,7 +820,10 @@ app.post('/execute', requireAuth, async (req: Request, res: Response) => {
         executeInBackground(requestId, code, metadata, secretsList);
         return res.json({ request_id: requestId, status: 'approved', session_id: sessionId, message: 'Auto-approved (session policy)' });
       }
-      if (violations?.length) console.log(`🚫 Policy violations for ${skill_id}:`, violations);
+      if (violations?.length) {
+        console.log(`🚫 Policy violations for ${skill_id}:`, violations);
+        policyViolations = violations;
+      }
     }
 
     // Would need human approval
@@ -844,7 +862,9 @@ app.post('/execute', requireAuth, async (req: Request, res: Response) => {
     }
 
     const statusUrl = PUBLIC_URL ? `${PUBLIC_URL}/execute/${requestId}/status?wait=true` : undefined;
-    res.json({ request_id: requestId, status: 'pending', session_id: sessionId, approval_url: approvalUrl, status_url: statusUrl, message: 'Awaiting approval — poll status_url to be notified when approved' });
+    const response: any = { request_id: requestId, status: 'pending', session_id: sessionId, approval_url: approvalUrl, status_url: statusUrl, message: 'Awaiting approval — poll status_url to be notified when approved' };
+    if (policyViolations?.length) response.policy_violations = policyViolations;
+    res.json(response);
   } catch (error: any) {
     console.error('Execute error:', error);
     res.status(500).json({ error: error.message });
@@ -856,9 +876,19 @@ const statusWaiters = new Map<string, Array<() => void>>();
 
 function notifyStatusWaiters(requestId: string) {
   const waiters = statusWaiters.get(requestId);
-  if (!waiters) return;
-  statusWaiters.delete(requestId);
-  for (const resolve of waiters) resolve();
+  if (waiters) {
+    statusWaiters.delete(requestId);
+    for (const resolve of waiters) resolve();
+  }
+  // Push notification to agent
+  if (AGENT_NOTIFY_URL) {
+    const record = db.getRequest(requestId);
+    fetch(AGENT_NOTIFY_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ request_id: requestId, status: record?.status || 'unknown' })
+    }).catch(err => console.log(`  Agent notify failed: ${err.message}`));
+  }
 }
 
 // Get execution status — supports ?wait=true for long-poll (up to 120s)
