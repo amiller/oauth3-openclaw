@@ -53,12 +53,13 @@ ${code}
 \`\`\`` }]
   })
 
-  const text = msg.content[0].type === 'text' ? msg.content[0].text : '{}'
+  let text = msg.content[0].type === 'text' ? msg.content[0].text : '{}'
+  text = text.replace(/^```(?:json)?\n?/m, '').replace(/\n?```$/m, '').trim()
   let parsed: any
   try {
     parsed = JSON.parse(text)
   } catch {
-    // Fallback if Haiku doesn't return clean JSON
+    console.log(`  Analysis parse error. Raw: ${text.substring(0, 200)}`)
     parsed = { summary: text, secretsUsed: [], networkTargets: [], isMutating: true, riskLevel: 'medium', concerns: ['Could not parse structured analysis'] }
   }
 
@@ -110,11 +111,14 @@ ${code}
 \`\`\`` }]
   })
 
-  const text = msg.content[0].type === 'text' ? msg.content[0].text : '{}'
+  let text = msg.content[0].type === 'text' ? msg.content[0].text : '{}'
+  // Strip markdown fences if Haiku wraps the response
+  text = text.replace(/^```(?:json)?\n?/m, '').replace(/\n?```$/m, '').trim()
   try {
     const parsed = JSON.parse(text)
     return { compliant: !!parsed.compliant, violations: parsed.violations || [] }
   } catch {
+    console.log(`  Compliance check parse error. Raw response: ${text.substring(0, 200)}`)
     return { compliant: false, violations: ['Could not parse compliance check — treating as non-compliant'] }
   }
 }
