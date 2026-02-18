@@ -20,7 +20,6 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const PUBLIC_URL = process.env.PUBLIC_URL || '';
 const API_BEARER_TOKEN = process.env.API_BEARER_TOKEN || '';
-const AGENT_NOTIFY_URL = process.env.AGENT_NOTIFY_URL || '';
 
 // Initialize database
 const db = new ProxyDatabase(DB_PATH);
@@ -163,7 +162,7 @@ Human approval gates execution — or session policies auto-approve within learn
 
 1. **Submit code** via \`POST /execute\`
 2. If status is \`pending\`, share the \`approval_url\` with the user (use markdown link formatting)
-3. **IMMEDIATELY long-poll** \`GET /execute/:id/status?wait=true\` — this blocks up to 120s and returns when the request is approved+executed or denied. You MUST call this right after submitting. Do NOT wait for the user to tell you it was approved. The server will push-notify you AND the long-poll will unblock.
+3. **IMMEDIATELY long-poll** \`GET /execute/:id/status?wait=true\` (with your bearer token) — this blocks up to 120s and returns when the request is approved+executed or denied. You MUST call this right after submitting. Do NOT wait for the user to tell you it was approved.
 4. If the long-poll times out (120s), re-poll. Loop until you get a terminal status.
 5. Result arrives in \`result.stdout\`
 
@@ -879,15 +878,6 @@ function notifyStatusWaiters(requestId: string) {
   if (waiters) {
     statusWaiters.delete(requestId);
     for (const resolve of waiters) resolve();
-  }
-  // Push notification to agent
-  if (AGENT_NOTIFY_URL) {
-    const record = db.getRequest(requestId);
-    fetch(AGENT_NOTIFY_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ request_id: requestId, status: record?.status || 'unknown' })
-    }).catch(err => console.log(`  Agent notify failed: ${err.message}`));
   }
 }
 

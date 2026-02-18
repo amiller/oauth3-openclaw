@@ -23,7 +23,7 @@ services:
       - internal
 
   oauth3-proxy:
-    image: ghcr.io/amiller/oauth3-proxy@sha256:42c9f4f3ea2f68ca254f0260d25847eb1d0492c26566a5b2ab9e0fccf71f5903
+    image: ghcr.io/amiller/oauth3-proxy@sha256:7b9213ea9a9a5fc9fa652753f2cd441c80987ad329a9e8cf81cbb8e5b3fb2010
     container_name: oauth3-proxy
     ports:
       - "3737:3737"
@@ -35,7 +35,6 @@ services:
       EXECUTOR_MODE: direct
       PUBLIC_URL: https://b50173318c7332d2a7e63e66770d11b2b6e67043-3737.dstack-pha-prod7.phala.network
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      AGENT_NOTIFY_URL: http://openclaw:18790/notify
       API_BEARER_TOKEN: ${API_BEARER_TOKEN:-}
     volumes:
       - oauth3_data:/data
