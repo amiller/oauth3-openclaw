@@ -89,6 +89,7 @@ export class TelegramApprovalBot {
     // Handle callback queries (button clicks)
     this.bot.on('callback_query', async (query) => {
       try {
+        if (query.message?.chat.id.toString() !== this.chatId) return;
         const data = query.data || '';
         const parts = data.split(':');
         const action = parts[0];

@@ -12,6 +12,7 @@ import { randomBytes } from 'crypto';
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
+app.use((_req, res, next) => { res.setHeader('Referrer-Policy', 'no-referrer'); next(); });
 
 // Config from environment
 const PORT = parseInt(process.env.PORT || '3737');
