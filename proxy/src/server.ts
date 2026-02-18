@@ -40,19 +40,34 @@ const pendingScopeRequests = new Map<string, {
 
 const RISK_LEVELS = { low: 0, medium: 1, high: 2 } as const;
 
-function structuralPolicyCheck(analysis: CodeAnalysis, policy: SessionPolicy): boolean {
-  if (analysis.secretsUsed.some(s => !policy.allowedSecrets.includes(s))) return false;
-  if (analysis.networkTargets.some(n => !policy.allowedNetworks.includes(n))) return false;
-  if (analysis.isMutating && !policy.allowMutating) return false;
-  if (RISK_LEVELS[analysis.riskLevel] > RISK_LEVELS[policy.maxRiskLevel]) return false;
-  return true;
+function structuralPolicyCheck(analysis: CodeAnalysis, policy: SessionPolicy): { pass: boolean; gaps: string[] } {
+  const gaps: string[] = [];
+  const newSecrets = analysis.secretsUsed.filter(s => !policy.allowedSecrets.includes(s));
+  if (newSecrets.length) gaps.push(`new secrets: ${newSecrets.join(', ')}`);
+  const newNetworks = analysis.networkTargets.filter(n => !policy.allowedNetworks.includes(n));
+  if (newNetworks.length) gaps.push(`new networks: ${newNetworks.join(', ')}`);
+  if (analysis.isMutating && !policy.allowMutating) gaps.push('mutating');
+  if (RISK_LEVELS[analysis.riskLevel] > RISK_LEVELS[policy.maxRiskLevel]) gaps.push(`risk ${analysis.riskLevel} > ${policy.maxRiskLevel}`);
+  return { pass: gaps.length === 0, gaps };
 }
 
 async function skillFitsPolicy(code: string, metadata: any, analysis: CodeAnalysis, policy: SessionPolicy): Promise<{ fits: boolean; violations?: string[] }> {
-  if (!structuralPolicyCheck(analysis, policy)) return { fits: false };
-  if (!policy.constraints?.length) return { fits: true };
-  const compliance = await checkPolicyCompliance(code, metadata, policy.constraints);
-  return { fits: compliance.compliant, violations: compliance.violations };
+  const structural = structuralPolicyCheck(analysis, policy);
+
+  // Explicit scope sessions (with constraints): structural gaps are OK if Haiku says compliant
+  // The human approved the scope — Haiku constraint check is the real gatekeeper
+  if (policy.constraints?.length) {
+    if (!structural.pass) console.log(`  Structural gaps (deferred to Haiku): ${structural.gaps.join(', ')}`);
+    const compliance = await checkPolicyCompliance(code, metadata, policy.constraints);
+    return { fits: compliance.compliant, violations: compliance.violations };
+  }
+
+  // Implicit sessions (no constraints): structural check is the only gatekeeper
+  if (!structural.pass) {
+    console.log(`  Structural policy check failed: ${structural.gaps.join(', ')}`);
+    return { fits: false };
+  }
+  return { fits: true };
 }
 
 function policyFromAnalysis(analysis: CodeAnalysis): SessionPolicy {
@@ -775,6 +790,8 @@ app.post('/execute', requireAuth, async (req: Request, res: Response) => {
     // Check session policy (structural + Haiku constraint check)
     const session = db.getSession(sessionId);
     if (session && analysis) {
+      console.log(`📋 Checking session ${sessionId}: secrets=${JSON.stringify(session.policy.allowedSecrets)} networks=${JSON.stringify(session.policy.allowedNetworks)} constraints=${session.policy.constraints?.length || 0}`);
+      console.log(`   Analysis: secrets=${JSON.stringify(analysis.secretsUsed)} networks=${JSON.stringify(analysis.networkTargets)} risk=${analysis.riskLevel}`);
       const { fits, violations } = await skillFitsPolicy(code, metadata, analysis, session.policy);
       if (fits) {
         if (dry_run) return res.json({ dry_run: true, would_auto_approve: true, reason: 'session_policy', session_id: sessionId, analysis });
