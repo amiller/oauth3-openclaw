@@ -81,7 +81,7 @@ export interface PolicyCompliance {
   violations: string[]
 }
 
-const COMPLIANCE_SYSTEM = `You are a policy compliance checker for sandboxed code execution. You will be given code and a list of policy constraints. Determine if the code complies with ALL constraints.
+const COMPLIANCE_SYSTEM = `You are a policy compliance checker for sandboxed code execution. You will be given code, a list of policy constraints, and optionally the actual argument values for this specific invocation.
 
 Return ONLY a JSON object:
 {
@@ -89,26 +89,32 @@ Return ONLY a JSON object:
   "violations": ["constraint text that was violated — and why"]
 }
 
-Be strict but fair. If the code COULD violate a constraint depending on runtime values, flag it. If the code clearly stays within bounds, mark compliant. Return ONLY JSON, no markdown fences.`
+IMPORTANT: When actual argument values are provided, judge compliance based on what the code WILL do with those specific values, not what it COULD do with arbitrary inputs. For example, if a constraint says "only repo X" and the code reads the repo from an arg, check the actual arg value — if it's "repo X", that's compliant.
+
+Only flag speculative risks when NO argument values are provided. Return ONLY JSON, no markdown fences.`
 
 export async function checkPolicyCompliance(
-  code: string, metadata: SkillMetadata, constraints: string[]
+  code: string, metadata: SkillMetadata, constraints: string[], args?: Record<string, any>
 ): Promise<PolicyCompliance> {
   if (!constraints.length) return { compliant: true, violations: [] }
+
+  let userContent = `Skill: ${metadata.skill}
+Description: ${metadata.description}
+
+Policy constraints:
+${constraints.map((c, i) => `${i + 1}. ${c}`).join('\n')}`
+
+  if (args && Object.keys(args).length) {
+    userContent += `\n\nActual invocation arguments:\n${Object.entries(args).map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join('\n')}`
+  }
+
+  userContent += `\n\n\`\`\`typescript\n${code}\n\`\`\``
 
   const msg = await client.messages.create({
     model: 'claude-haiku-4-5-20251001',
     max_tokens: 512,
     system: COMPLIANCE_SYSTEM,
-    messages: [{ role: 'user', content: `Skill: ${metadata.skill}
-Description: ${metadata.description}
-
-Policy constraints:
-${constraints.map((c, i) => `${i + 1}. ${c}`).join('\n')}
-
-\`\`\`typescript
-${code}
-\`\`\`` }]
+    messages: [{ role: 'user', content: userContent }]
   })
 
   let text = msg.content[0].type === 'text' ? msg.content[0].text : '{}'

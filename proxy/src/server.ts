@@ -52,14 +52,14 @@ function structuralPolicyCheck(analysis: CodeAnalysis, policy: SessionPolicy): {
   return { pass: gaps.length === 0, gaps };
 }
 
-async function skillFitsPolicy(code: string, metadata: any, analysis: CodeAnalysis, policy: SessionPolicy): Promise<{ fits: boolean; violations?: string[] }> {
+async function skillFitsPolicy(code: string, metadata: any, analysis: CodeAnalysis, policy: SessionPolicy, args?: Record<string, any>): Promise<{ fits: boolean; violations?: string[] }> {
   const structural = structuralPolicyCheck(analysis, policy);
 
   // Explicit scope sessions (with constraints): structural gaps are OK if Haiku says compliant
   // The human approved the scope — Haiku constraint check is the real gatekeeper
   if (policy.constraints?.length) {
     if (!structural.pass) console.log(`  Structural gaps (deferred to Haiku): ${structural.gaps.join(', ')}`);
-    const compliance = await checkPolicyCompliance(code, metadata, policy.constraints);
+    const compliance = await checkPolicyCompliance(code, metadata, policy.constraints, args);
     return { fits: compliance.compliant, violations: compliance.violations };
   }
 
@@ -807,7 +807,7 @@ app.post('/execute', requireAuth, async (req: Request, res: Response) => {
     if (session && analysis) {
       console.log(`📋 Checking session ${sessionId}: secrets=${JSON.stringify(session.policy.allowedSecrets)} networks=${JSON.stringify(session.policy.allowedNetworks)} constraints=${session.policy.constraints?.length || 0}`);
       console.log(`   Analysis: secrets=${JSON.stringify(analysis.secretsUsed)} networks=${JSON.stringify(analysis.networkTargets)} risk=${analysis.riskLevel}`);
-      const { fits, violations } = await skillFitsPolicy(code, metadata, analysis, session.policy);
+      const { fits, violations } = await skillFitsPolicy(code, metadata, analysis, session.policy, args);
       if (fits) {
         if (dry_run) return res.json({ dry_run: true, would_auto_approve: true, reason: 'session_policy', session_id: sessionId, analysis });
         console.log(`⚡ Auto-approved via session ${sessionId}: ${skill_id}`);
