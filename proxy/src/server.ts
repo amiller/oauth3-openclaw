@@ -778,8 +778,11 @@ app.post('/scope', requireAuth, async (req: Request, res: Response) => {
       secrets: secretsList, networks: networksList
     });
 
-    const approvalUrl = PUBLIC_URL ? `${PUBLIC_URL}/approve/${requestId}?token=${approvalToken}` : undefined;
-    const statusUrl = PUBLIC_URL ? `${PUBLIC_URL}/execute/${requestId}/status?wait=true` : undefined;
+    const orchUrl = req.headers['x-orchestrator-url'] as string | undefined;
+    const orchTenant = req.headers['x-tenant-id'] as string | undefined;
+    const urlBase = orchUrl && orchTenant ? `${orchUrl}/t/${orchTenant}` : PUBLIC_URL;
+    const approvalUrl = urlBase ? `${urlBase}/approve/${requestId}?token=${approvalToken}` : undefined;
+    const statusUrl = urlBase ? `${urlBase}/execute/${requestId}/status?wait=true` : undefined;
     res.json({ request_id: requestId, status: 'pending_scope', session_id: sessionId, approval_url: approvalUrl, status_url: statusUrl, message: 'Scope request awaiting approval — poll status_url to be notified when approved' });
   } catch (error: any) {
     console.error('Scope request error:', error);
@@ -887,14 +890,17 @@ app.post('/execute', requireAuth, async (req: Request, res: Response) => {
     pendingSessionIds.set(requestId, sessionId);
     if (analysis) pendingAnalyses.set(requestId, analysis);
 
-    const approvalUrl = PUBLIC_URL ? `${PUBLIC_URL}/approve/${requestId}?token=${approvalToken}` : undefined;
+    const orchUrl = req.headers['x-orchestrator-url'] as string | undefined;
+    const orchTenant = req.headers['x-tenant-id'] as string | undefined;
+    const urlBase = orchUrl && orchTenant ? `${orchUrl}/t/${orchTenant}` : PUBLIC_URL;
+    const approvalUrl = urlBase ? `${urlBase}/approve/${requestId}?token=${approvalToken}` : undefined;
 
     if (telegramBot && approvalUrl) {
       const messageId = await telegramBot.sendApprovalLink(requestId, skill_id, metadata, approvalUrl, analysis?.summary);
       db.updateRequestStatus(requestId, 'pending', messageId);
     }
 
-    const statusUrl = PUBLIC_URL ? `${PUBLIC_URL}/execute/${requestId}/status?wait=true` : undefined;
+    const statusUrl = urlBase ? `${urlBase}/execute/${requestId}/status?wait=true` : undefined;
     const response: any = { request_id: requestId, status: 'pending', session_id: sessionId, approval_url: approvalUrl, status_url: statusUrl, message: 'Awaiting approval — poll status_url to be notified when approved' };
     if (policyViolations?.length) response.policy_violations = policyViolations;
     res.json(response);
