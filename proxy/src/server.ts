@@ -6,7 +6,7 @@ import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import { ProxyDatabase, SessionPolicy } from './database.js';
 import { executeSkill, hashCode, parseMetadata, EXECUTOR_MODE } from './executor.js';
-import { analyzeCode, CodeAnalysis, checkPolicyCompliance } from './analyzer.js';
+import { analyzeCode, CodeAnalysis, reviewCode, CodeReview, reviewInvocation, checkPolicyCompliance } from './analyzer.js';
 import { randomBytes } from 'crypto';
 
 const app = express();
@@ -51,14 +51,33 @@ function structuralPolicyCheck(analysis: CodeAnalysis, policy: SessionPolicy): {
   return { pass: gaps.length === 0, gaps };
 }
 
-async function skillFitsPolicy(code: string, metadata: any, analysis: CodeAnalysis, policy: SessionPolicy, args?: Record<string, any>): Promise<{ fits: boolean; violations?: string[] }> {
+async function skillFitsPolicy(code: string, metadata: any, analysis: CodeAnalysis, policy: SessionPolicy, args?: Record<string, any>, codeHash?: string): Promise<{ fits: boolean; violations?: string[] }> {
   const structural = structuralPolicyCheck(analysis, policy);
 
-  // Explicit scope sessions (with constraints): structural gaps are OK if Haiku says compliant
-  // The human approved the scope — Haiku constraint check is the real gatekeeper
+  // Explicit scope sessions (with constraints): two-call review
   if (policy.constraints?.length) {
-    if (!structural.pass) console.log(`  Structural gaps (deferred to Haiku): ${structural.gaps.join(', ')}`);
-    const compliance = await checkPolicyCompliance(code, metadata, policy.constraints, args);
+    if (!structural.pass) console.log(`  Structural gaps (deferred to review): ${structural.gaps.join(', ')}`);
+
+    // Call 2: Code review (cached) — is the code faithful and well-behaved?
+    const reviewCache = {
+      get: (h: string) => db.getCodeReview(h),
+      set: (h: string, r: CodeReview) => db.setCodeReview(h, r)
+    };
+    const review = await reviewCode(code, metadata, codeHash || '', reviewCache);
+    if (!review.faithful) {
+      console.log(`  Code review: NOT faithful — ${review.concerns.join(', ')}`);
+      return { fits: false, violations: ['Code does not faithfully implement its description'] };
+    }
+    console.log(`  Code review: faithful, params=[${review.parameterized.join(',')}] hardcoded=${JSON.stringify(review.hardcoded)}`);
+
+    // Call 3: Invocation review (per-call) — are these specific args within bounds?
+    if (args && Object.keys(args).length) {
+      const compliance = await reviewInvocation(review, analysis, metadata, policy.constraints, args);
+      return { fits: compliance.compliant, violations: compliance.violations };
+    }
+
+    // Fallback: no args, use legacy combined check
+    const compliance = await checkPolicyCompliance(code, metadata, policy.constraints);
     return { fits: compliance.compliant, violations: compliance.violations };
   }
 
@@ -277,8 +296,22 @@ Pass \`session_id\` to group related requests. Two ways to create a session:
 1. **Implicit** — first manual approval creates a session policy from Haiku analysis
 2. **Explicit** — \`POST /scope\` to request a session with specific constraints upfront
 
-Subsequent requests that fit within the policy auto-approve (structural check +
-Haiku constraint review). Sessions expire after 2h of inactivity.
+Subsequent requests that fit within the policy auto-approve. Sessions expire after 2h of inactivity.
+
+### Three-layer review for constrained sessions:
+1. **Structural analysis** (cached by code hash) — extracts secrets, networks, risk level
+2. **Code review** (cached by code hash) — verifies code is faithful to its description,
+   identifies what's parameterized (from args) vs hardcoded in source
+3. **Invocation review** (per-call, NOT cached) — checks actual arg values against constraints.
+   Does NOT re-read the code — just the review summary + args. Fast.
+
+### Writing good skills for auto-approval:
+- Write **generic, parameterized** skills — take repo/path/etc as args, not hardcoded
+- The code review verifies the code only accesses what its args specify
+- The invocation review checks each call's arg values against the scope constraints
+- Example: a \`create-issue\` skill that takes \`repo\` as arg. Code review confirms it only
+  hits \`/repos/{repo}/issues\`. Invocation review checks \`repo=owockibot/bounty\` is within bounds.
+- Avoid embedding request bodies in skill code — pass them as args for stable code hashes
 
 Trusted code (approved with "Trust Code") auto-executes forever by code hash.
 
@@ -806,7 +839,7 @@ app.post('/execute', requireAuth, async (req: Request, res: Response) => {
     if (session && analysis) {
       console.log(`📋 Checking session ${sessionId}: secrets=${JSON.stringify(session.policy.allowedSecrets)} networks=${JSON.stringify(session.policy.allowedNetworks)} constraints=${session.policy.constraints?.length || 0}`);
       console.log(`   Analysis: secrets=${JSON.stringify(analysis.secretsUsed)} networks=${JSON.stringify(analysis.networkTargets)} risk=${analysis.riskLevel}`);
-      const { fits, violations } = await skillFitsPolicy(code, metadata, analysis, session.policy, args);
+      const { fits, violations } = await skillFitsPolicy(code, metadata, analysis, session.policy, args, codeHash);
       if (fits) {
         if (dry_run) return res.json({ dry_run: true, would_auto_approve: true, reason: 'session_policy', session_id: sessionId, analysis });
         console.log(`⚡ Auto-approved via session ${sessionId}: ${skill_id}`);

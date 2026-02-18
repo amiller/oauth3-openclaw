@@ -80,6 +80,12 @@ export class ProxyDatabase {
         created_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS code_reviews (
+        code_hash TEXT PRIMARY KEY,
+        review TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS sessions (
         session_id TEXT PRIMARY KEY,
         created_at INTEGER NOT NULL,
@@ -260,6 +266,22 @@ export class ProxyDatabase {
     this.db.prepare(
       'INSERT OR REPLACE INTO code_analysis (code_hash, summary, created_at) VALUES (?, ?, ?)'
     ).run(codeHash, data, Date.now());
+  }
+
+  // Code review cache
+
+  getCodeReview(codeHash: string): any | undefined {
+    const row = this.db.prepare(
+      'SELECT review FROM code_reviews WHERE code_hash = ?'
+    ).get(codeHash) as { review: string } | undefined;
+    if (!row) return undefined;
+    try { return JSON.parse(row.review) } catch { return undefined }
+  }
+
+  setCodeReview(codeHash: string, review: any): void {
+    this.db.prepare(
+      'INSERT OR REPLACE INTO code_reviews (code_hash, review, created_at) VALUES (?, ?, ?)'
+    ).run(codeHash, JSON.stringify(review), Date.now());
   }
 
   // Sessions

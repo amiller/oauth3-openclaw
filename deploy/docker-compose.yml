@@ -23,7 +23,7 @@ services:
       - internal
 
   oauth3-proxy:
-    image: ghcr.io/amiller/oauth3-proxy@sha256:7b9213ea9a9a5fc9fa652753f2cd441c80987ad329a9e8cf81cbb8e5b3fb2010
+    image: ghcr.io/amiller/oauth3-proxy@sha256:09e49fcd1fb3258faab6e340b02d0637e5291cf590fbeec45a9e467eda009351
     container_name: oauth3-proxy
     ports:
       - "3737:3737"
