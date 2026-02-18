@@ -1,32 +1,19 @@
 # Roadmap
 
-## Done
+## Now
 
-- TEE deployment on Phala CVM (dstack)
-- Web-based approval pages served from TEE
-- Session management with scope-based auto-approval
-- Three-layer Haiku review (static analysis, constraint compliance, arg review)
-- Natural-language constraints on scopes
-- Web dashboard for browsing sessions and executions
-- Bearer token auth on internal endpoints
-- Long-poll status endpoint (`?wait=true`, 120s)
-- Push notifications to agent on status changes
-- Dry run mode
-- Discovery endpoint (`/.well-known/oauth3-proxy`)
-- Inline `skill_code` in execute requests
-- `gh-gateway` — GitHub CLI interception via `GH_HOST` rewrite
-- `phala-gateway` — Phala CLI interception pattern
+- Haiku inconsistency on scope-approved destructive ops (#9)
+- Agent adoption of long-poll workflow
+- `.env.example` for deploy setup
 
-## In Progress
+## Next
 
-- Agent adoption of long-poll (replacing file-based notification)
-- Push notification listener on openclaw side
+- Constraint counters — "allow up to N executions" with auto-expiry
+- Multi-runtime (Python, Node alongside Deno)
+- IP-based auth for known agent hosts
 
-## Future
+## Later
 
-- **Static/dynamic arg review refinement** — cache code analysis by hash, only re-run arg review per invocation (#14)
-- **Scope-approved destructive actions** — Haiku inconsistently gates destructive ops even when scope allows them (#9)
-- **Rename skill → scope** — terminology cleanup throughout codebase
-- **IP-based auth** — allow requests from known IPs without bearer token
-- **Constraint counters** — "allow up to N executions" with automatic session expiry
-- **Multi-runtime support** — Python, Node in addition to Deno
+- Multi-tenant: one TEE serves many users' agents ([PRD](docs/prd-your-shell-or-mine.md))
+- GNAP-compatible grant negotiation ([positioning](docs/gnap-positioning.md))
+- Attested audit log — cryptographic proof of what ran and when

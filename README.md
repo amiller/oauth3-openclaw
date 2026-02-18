@@ -1,93 +1,106 @@
-# OAuth3-OpenClaw
+# OAuth3 Proxy
 
-Programmable API gateway running in a TEE. Agents submit code for execution, humans approve scopes via web UI, and Haiku reviews each invocation against natural-language constraints.
+**Your agent's keys don't belong on your agent's machine.**
+
+OAuth3 Proxy runs inside a TEE (Trusted Execution Environment) and holds API keys on behalf of AI agents. When an agent needs to use a key — call the GitHub API, post to Slack, sign a transaction — it submits code to the proxy. A human approves (or the session policy auto-approves), the code runs inside the enclave with the key injected, and only the result comes back. The key never touches the agent's host.
 
 ```
-Agent (openclaw)              Human (browser)
-    │                              │
-    ├─ POST /scope ──────────────► approval page (TEE HTTPS)
-    ├─ POST /execute ──────┐      │
-    │  (auto-approve or ◄──┘      ├─ GET /dashboard
-    │   pending)                   │
-    ▼                              ▼
-┌─────────────────────────────────────┐
-│  OAuth3 Proxy (Deno sandbox + TEE)  │
-│  ├─ Three-layer Haiku review        │
-│  ├─ Session policy management       │
-│  └─ Secret injection                │
-└─────────────────────────────────────┘
-                 │
-                 ▼
-         External APIs (GitHub, Phala, etc.)
+Your machine                          TEE (dstack CVM)
+┌──────────┐                    ┌──────────────────────┐
+│  Agent   │── POST /execute ──►│  OAuth3 Proxy        │
+│          │◄─ result ──────────│  ├─ holds your keys   │
+└──────────┘                    │  ├─ runs code in Deno │
+                                │  └─ Haiku reviews it  │
+┌──────────┐                    │                      │
+│  You     │── approve via ────►│  approval page       │
+│ (browser)│   TEE HTTPS        │  dashboard           │
+└──────────┘                    └──────────────────────┘
 ```
 
-## Development Workflow
+## Why
 
-Two agents collaborate through the proxy:
+AI agents are gaining tool-use capabilities fast. The bottleneck is trust: if you give an agent your GitHub token, it can do *anything* with that token. OAuth scopes are too coarse. Revoking access requires rotating the key.
 
-- **Claude Code** — develops the proxy, handles issues, deploys via SSH/`phala` CLI
-- **Openclaw agent** — integration-tests the proxy, co-designs scopes + skills, files issues
+This proxy inverts the model. Instead of delegating a key, you delegate *specific operations*. The agent writes code describing what it wants to do, an LLM reviews the code against natural-language constraints you set, and execution happens in a sandbox you never gave the key to.
 
-Both run as Docker containers on a Phala CVM connected via an `internal` bridge network. The proxy is accessible externally at its dstack HTTPS URL.
+It's like `sudo` for AI agents, where the TEE is the trusted kernel.
 
-## Key Concepts
+## How it works
 
-**Scopes** — An agent requests a scope (`POST /scope`) describing what it wants to do, with natural-language constraints. A human approves the scope via a web page served from the TEE.
+1. **Agent submits code** — `POST /execute` with inline TypeScript
+2. **Three-layer review** — Haiku analyzes the code (cached), checks constraints, reviews runtime args
+3. **Human approves** (or session auto-approves) — web page served from the TEE
+4. **Code runs in Deno sandbox** — secrets injected as env vars, network restricted
+5. **Result returned** — agent long-polls `/execute/:id/status?wait=true`
 
-**Sessions** — An approved scope creates a session. Subsequent `POST /execute` calls referencing the session are auto-approved if they pass Haiku review.
+Sessions remember your approvals. After you approve a scope ("this agent can read/write issues on repo X"), subsequent matching operations auto-approve without prompting.
 
-**Three-layer review** — Every execution goes through:
-1. **Static code analysis** — is this code safe? (cacheable by hash)
-2. **Constraint compliance** — does it match the session's constraints?
-3. **Argument review** — are the runtime args safe?
+## Deploy on dstack
 
-**Co-design pattern** — Write per-operation skills with hardcoded values, then write constraints that describe exactly what the code does. Haiku checks for correspondence, not minimality.
-
-## API Reference
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/execute` | Submit code for execution (`skill_code` or `skill_url`) |
-| `GET` | `/execute/:id/status?wait=true` | Long-poll for result (120s timeout) |
-| `POST` | `/scope` | Request a scope with constraints |
-| `GET/POST` | `/approve/:id?token=...` | Web-based approval page |
-| `GET` | `/sessions` | List active sessions |
-| `GET` | `/sessions/:id` | Session details |
-| `DELETE` | `/sessions/:id` | Revoke a session |
-| `GET` | `/dashboard?token=...` | Web UI for browsing sessions/executions |
-| `GET` | `/health` | Health check |
-| `GET` | `/.well-known/oauth3-proxy` | Discovery endpoint |
-
-## Deployment
+Requires [dstack](https://github.com/aspect-build/dstack) (Phala CVM or any TEE-capable host).
 
 ```bash
-# Build
-docker build -t ghcr.io/amiller/oauth3-proxy:latest -f proxy/Dockerfile proxy/
+# 1. Clone
+git clone https://github.com/amiller/oauth3-openclaw && cd oauth3-openclaw
 
-# Push
-docker push ghcr.io/amiller/oauth3-proxy:latest
+# 2. Configure
+cp deploy/.env.example deploy/.env
+# Edit deploy/.env — set ANTHROPIC_API_KEY, API_BEARER_TOKEN, and any secrets
 
-# Update digest in deploy/docker-compose.yml, then:
+# 3. Build and push the proxy image
+docker build -t ghcr.io/YOUR_USER/oauth3-proxy:latest -f proxy/Dockerfile proxy/
+docker push ghcr.io/YOUR_USER/oauth3-proxy:latest
+
+# 4. Update the image digest in deploy/docker-compose.yml
+
+# 5. Deploy to your CVM
 phala deploy --cvm-id <VM_UUID> -c deploy/docker-compose.yml -e deploy/.env --wait
 ```
 
-## Project Structure
+The proxy starts on port 3737. Your agent talks to it over the internal Docker network; the approval UI is exposed over dstack's HTTPS endpoint.
+
+## Agent integration
+
+Once deployed, the proxy serves its own protocol docs at `GET /`. Point your agent there and it knows how to use it. The short version:
+
+```bash
+# Submit code for execution
+curl -X POST https://your-cvm-url/execute \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"skill_code": "const resp = await fetch(\"https://api.github.com/repos/you/repo/issues\", { headers: { Authorization: \"Bearer \" + Deno.env.get(\"GITHUB_TOKEN\") }}); console.log(JSON.stringify(await resp.json()));"}'
+
+# Long-poll for result (blocks up to 120s)
+curl https://your-cvm-url/execute/REQ_ID/status?wait=true \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+For repeated operations, use scopes (`POST /scope`) to set up a session with constraints like "can only read issues on repo X" — then executions matching those constraints auto-approve.
+
+## What this is and isn't
+
+**This is** a working prototype of TEE-based key custody for AI agents. It's useful today if you run dstack and want to give an agent scoped access to your API keys without handing them over.
+
+**This isn't** a production multi-tenant service (yet). Right now it's single-user, single-TEE. The [hosted multi-tenant version](docs/prd-your-shell-or-mine.md) where one TEE serves many users is the eventual product direction.
+
+**Open questions:**
+- How should agents discover and negotiate with proxies? ([GNAP positioning](docs/gnap-positioning.md))
+- Haiku is inconsistent at gating destructive operations even when the scope explicitly allows them ([#9](https://github.com/amiller/oauth3-openclaw/issues/9))
+- Should code review be separated from arg review for cacheability? (Done — [#14](https://github.com/amiller/oauth3-openclaw/issues/14))
+
+## Project structure
 
 ```
 proxy/src/
-├── server.ts      # Express server, routes, approval pages, dashboard
-├── analyzer.ts    # Three-layer Haiku review (static + constraints + args)
-├── executor.ts    # Deno sandbox execution
-├── database.ts    # SQLite storage (sessions, executions, secrets)
-├── telegram.ts    # Optional Telegram bot integration
+├── server.ts      # Routes, approval pages, dashboard
+├── analyzer.ts    # Three-layer Haiku review
+├── executor.ts    # Deno sandbox execution (Docker or direct mode)
+├── database.ts    # SQLite (sessions, executions, secrets)
+├── telegram.ts    # Optional Telegram notifications
 └── types.ts       # TypeScript types
 deploy/
-├── docker-compose.yml  # Phala CVM deployment config
-├── .env                # Environment variables
-└── ssh-cvm.sh          # SSH helper for CVM access
-docs/
-├── gnap-positioning.md       # GNAP/RFC 9635 positioning
-└── prd-your-shell-or-mine.md # Future prototype PRD
+├── docker-compose.yml  # CVM deployment config
+└── .env                # Secrets (not committed)
 ```
 
 ## License
