@@ -19,6 +19,7 @@ export interface ExecutionRecord {
   result: string | null; // JSON
   error: string | null;
   telegram_message_id: number | null;
+  approval_token: string | null;
 }
 
 export interface ApprovalRecord {
@@ -73,12 +74,32 @@ export class ProxyDatabase {
         updated_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS code_analysis (
+        code_hash TEXT PRIMARY KEY,
+        summary TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS code_reviews (
+        code_hash TEXT PRIMARY KEY,
+        review TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS sessions (
+        session_id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        last_activity INTEGER NOT NULL,
+        policy TEXT NOT NULL DEFAULT '{}'
+      );
+
       CREATE INDEX IF NOT EXISTS idx_requests_status ON execution_requests(status);
       CREATE INDEX IF NOT EXISTS idx_requests_created ON execution_requests(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_approvals_expires ON skill_approvals(expires_at);
     `);
-    // Migrate: add code column if missing
+    // Migrations
     try { this.db.exec('ALTER TABLE execution_requests ADD COLUMN code TEXT'); } catch {}
+    try { this.db.exec('ALTER TABLE execution_requests ADD COLUMN approval_token TEXT'); } catch {}
   }
 
   // Execution Requests
@@ -89,11 +110,12 @@ export class ProxyDatabase {
     skillUrl: string,
     codeHash: string,
     secrets: string[],
-    args?: Record<string, any>
+    args?: Record<string, any>,
+    approvalToken?: string
   ): void {
     this.db.prepare(`
-      INSERT INTO execution_requests (id, skill_id, skill_url, code_hash, secrets, args, status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+      INSERT INTO execution_requests (id, skill_id, skill_url, code_hash, secrets, args, status, created_at, approval_token)
+      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
     `).run(
       id,
       skillId,
@@ -101,7 +123,8 @@ export class ProxyDatabase {
       codeHash,
       JSON.stringify(secrets),
       args ? JSON.stringify(args) : null,
-      Date.now()
+      Date.now(),
+      approvalToken || null
     );
   }
 
@@ -223,7 +246,99 @@ export class ProxyDatabase {
     return row?.code ?? null;
   }
 
+  // Code analysis cache
+
+  getAnalysis(codeHash: string): any | undefined {
+    const row = this.db.prepare(
+      'SELECT summary, created_at as timestamp FROM code_analysis WHERE code_hash = ?'
+    ).get(codeHash) as { summary: string; timestamp: number } | undefined;
+    if (!row) return undefined;
+    // Try parsing as structured JSON, fall back to legacy string format
+    try {
+      return JSON.parse(row.summary);
+    } catch {
+      return { summary: row.summary, timestamp: row.timestamp, secretsUsed: [], networkTargets: [], isMutating: true, riskLevel: 'medium' as const, concerns: [] };
+    }
+  }
+
+  setAnalysis(codeHash: string, analysis: any): void {
+    const data = typeof analysis === 'string' ? analysis : JSON.stringify(analysis);
+    this.db.prepare(
+      'INSERT OR REPLACE INTO code_analysis (code_hash, summary, created_at) VALUES (?, ?, ?)'
+    ).run(codeHash, data, Date.now());
+  }
+
+  // Code review cache
+
+  getCodeReview(codeHash: string): any | undefined {
+    const row = this.db.prepare(
+      'SELECT review FROM code_reviews WHERE code_hash = ?'
+    ).get(codeHash) as { review: string } | undefined;
+    if (!row) return undefined;
+    try { return JSON.parse(row.review) } catch { return undefined }
+  }
+
+  setCodeReview(codeHash: string, review: any): void {
+    this.db.prepare(
+      'INSERT OR REPLACE INTO code_reviews (code_hash, review, created_at) VALUES (?, ?, ?)'
+    ).run(codeHash, JSON.stringify(review), Date.now());
+  }
+
+  // Sessions
+
+  createSession(sessionId: string, policy: SessionPolicy): void {
+    const now = Date.now();
+    this.db.prepare(
+      'INSERT OR REPLACE INTO sessions (session_id, created_at, last_activity, policy) VALUES (?, ?, ?, ?)'
+    ).run(sessionId, now, now, JSON.stringify(policy));
+  }
+
+  getSession(sessionId: string): { session_id: string; created_at: number; last_activity: number; policy: SessionPolicy } | undefined {
+    const row = this.db.prepare('SELECT * FROM sessions WHERE session_id = ?').get(sessionId) as any;
+    if (!row) return undefined;
+    // Expire after 2 hours of inactivity
+    if (Date.now() - row.last_activity > 2 * 60 * 60 * 1000) {
+      this.db.prepare('DELETE FROM sessions WHERE session_id = ?').run(sessionId);
+      return undefined;
+    }
+    return { ...row, policy: JSON.parse(row.policy) };
+  }
+
+  touchSession(sessionId: string): void {
+    this.db.prepare('UPDATE sessions SET last_activity = ? WHERE session_id = ?').run(Date.now(), sessionId);
+  }
+
+  updateSessionPolicy(sessionId: string, policy: SessionPolicy): void {
+    this.db.prepare('UPDATE sessions SET policy = ?, last_activity = ? WHERE session_id = ?')
+      .run(JSON.stringify(policy), Date.now(), sessionId);
+  }
+
+  deleteSession(sessionId: string): void {
+    this.db.prepare('DELETE FROM sessions WHERE session_id = ?').run(sessionId);
+  }
+
+  listSessions(): Array<{ session_id: string; created_at: number; last_activity: number; policy: SessionPolicy }> {
+    const now = Date.now();
+    // Clean expired first
+    this.db.prepare('DELETE FROM sessions WHERE ? - last_activity > ?').run(now, 2 * 60 * 60 * 1000);
+    const rows = this.db.prepare('SELECT * FROM sessions ORDER BY last_activity DESC').all() as any[];
+    return rows.map(r => ({ ...r, policy: JSON.parse(r.policy) }));
+  }
+
+  listRecentRequests(limit = 20): ExecutionRecord[] {
+    return this.db.prepare('SELECT * FROM execution_requests ORDER BY created_at DESC LIMIT ?').all(limit) as ExecutionRecord[];
+  }
+
   close(): void {
     this.db.close();
   }
+}
+
+export interface SessionPolicy {
+  allowedSecrets: string[];
+  allowedNetworks: string[];
+  allowMutating: boolean;
+  maxRiskLevel: 'low' | 'medium' | 'high';
+  constraints?: string[];
+  description?: string;
 }

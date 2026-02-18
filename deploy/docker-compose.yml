@@ -1,6 +1,7 @@
 services:
   openclaw:
     image: h4x3rotab/openclaw-cvm@sha256:f0e1c170b5f122753011c1cfb47c939dbec2f65e1f1ead64a3c4c912615b39a2
+    container_name: openclaw
     privileged: true
     ports:
       - "1022:22"
@@ -9,19 +10,21 @@ services:
       - /home/root/.ssh:/root/.ssh:ro
       - openclaw_data:/data
       - docker_data:/var/lib/docker
-      - /var/run/dstack.sock:/var/run/dstack.sock
     environment:
       NODE_ENV: production
       MASTER_KEY: ${MASTER_KEY:-}
       REDPILL_API_KEY: ${REDPILL_API_KEY:-}
       ANTHROPIC_OAUTH_TOKEN: ${ANTHROPIC_OAUTH_TOKEN:-}
       TELEGRAM_BOT_TOKEN: ${OPENCLAW_TELEGRAM_BOT_TOKEN:-}
+      OAUTH3_PROXY_URL: http://oauth3-proxy:3737
+      OAUTH3_BEARER_TOKEN: ${API_BEARER_TOKEN:-}
     restart: unless-stopped
     networks:
       - internal
 
   oauth3-proxy:
-    image: ghcr.io/amiller/oauth3-proxy@sha256:fb2a31d2a474e2e45948be21948951dbbc6b059a637e27c5a5f2239e93e0e1b2
+    image: ghcr.io/amiller/oauth3-proxy@sha256:09e49fcd1fb3258faab6e340b02d0637e5291cf590fbeec45a9e467eda009351
+    container_name: oauth3-proxy
     ports:
       - "3737:3737"
     environment:
@@ -32,6 +35,7 @@ services:
       EXECUTOR_MODE: direct
       PUBLIC_URL: https://b50173318c7332d2a7e63e66770d11b2b6e67043-3737.dstack-pha-prod7.phala.network
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      API_BEARER_TOKEN: ${API_BEARER_TOKEN:-}
     volumes:
       - oauth3_data:/data
     restart: unless-stopped

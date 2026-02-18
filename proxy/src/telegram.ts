@@ -3,7 +3,7 @@
  */
 
 import TelegramBot from 'node-telegram-bot-api';
-import { ProxyDatabase } from './database.js';
+import { ProxyDatabase, SessionPolicy } from './database.js';
 import { appendFile } from 'fs/promises';
 
 interface PendingApproval {
@@ -11,6 +11,11 @@ interface PendingApproval {
   level: 'once' | '24h' | 'forever' | 'trust_code';
   messageId: number;
   requiredSecrets: string[];
+}
+
+interface RequestMessage {
+  messageId: number;
+  baseText: string; // original message text (HTML)
 }
 
 export class TelegramApprovalBot {
@@ -22,6 +27,7 @@ export class TelegramApprovalBot {
   private secretStore: Record<string, string>;
   private pendingApprovals: Map<string, PendingApproval>;
   private requestMetadata: Map<string, string[]>; // requestId -> required secrets
+  private requestMessages: Map<string, RequestMessage>; // requestId -> original message info
   private publicUrl: string;
 
   constructor(
@@ -41,6 +47,7 @@ export class TelegramApprovalBot {
     this.onDenial = onDenial;
     this.pendingApprovals = new Map();
     this.requestMetadata = new Map();
+    this.requestMessages = new Map();
     this.publicUrl = publicUrl;
 
     this.setupHandlers();
@@ -53,9 +60,10 @@ export class TelegramApprovalBot {
       const notif = `${timestamp} ${message}\n`;
       await appendFile('/tmp/oauth3-notifications.log', notif);
       
-      // Also try to POST to local notification endpoint (if available)
+      // POST to agent notification endpoint
+      const notifyUrl = process.env.AGENT_NOTIFY_URL || 'http://127.0.0.1:18790/notify';
       try {
-        const response = await fetch('http://127.0.0.1:18790/notify', {
+        const response = await fetch(notifyUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ message }),
@@ -81,36 +89,58 @@ export class TelegramApprovalBot {
     // Handle callback queries (button clicks)
     this.bot.on('callback_query', async (query) => {
       try {
+        if (query.message?.chat.id.toString() !== this.chatId) return;
         const data = query.data || '';
         const parts = data.split(':');
         const action = parts[0];
 
         if (action === 'add_secret') {
-          // Handle "Add SECRET_NAME" button
           const secretName = parts[1];
-          const relatedRequestId = parts[2]; // Optional - if this secret is for a pending approval
-          
+          const relatedRequestId = parts[2];
           await this.bot.answerCallbackQuery(query.id, {
             text: `Reply to this message with the value for ${secretName}`
           });
-          
-          // Send a force_reply message
-          const sent = await this.bot.sendMessage(
+          await this.bot.sendMessage(
             query.message!.chat.id,
             `🔑 Add Secret: ${secretName}\n\nReply to this message with the secret value.\n\n⚠️ The message will be deleted immediately for security.`,
-            {
-              reply_markup: {
-                force_reply: true,
-                selective: true
-              }
-            }
+            { reply_markup: { force_reply: true, selective: true } }
           );
-          
-          // Store metadata so we know which request this secret is for
-          if (relatedRequestId) {
-            (sent as any)._relatedRequestId = relatedRequestId;
+          return;
+        }
+
+        if (action === 'delete_secret') {
+          const secretName = parts[1];
+          if (!this.secretStore[secretName]) {
+            await this.bot.answerCallbackQuery(query.id, { text: `Not found: ${secretName}` });
+            return;
           }
-          
+          delete this.secretStore[secretName];
+          this.db.deleteSecret(secretName);
+          await this.bot.answerCallbackQuery(query.id, { text: `Deleted: ${secretName}` });
+          console.log(`🗑 Secret deleted via menu: ${secretName}`);
+          await this.refreshSecretsMenu(query.message!);
+          return;
+        }
+
+        if (action === 'replace_secret') {
+          const secretName = parts[1];
+          await this.bot.answerCallbackQuery(query.id, {
+            text: `Reply with the new value for ${secretName}`
+          });
+          await this.bot.sendMessage(
+            query.message!.chat.id,
+            `🔑 Add Secret: ${secretName}\n\nReply to this message with the secret value.\n\n⚠️ The message will be deleted immediately for security.`,
+            { reply_markup: { force_reply: true, selective: true } }
+          );
+          return;
+        }
+
+        if (action === 'add_new_secret') {
+          await this.bot.answerCallbackQuery(query.id);
+          await this.bot.sendMessage(
+            query.message!.chat.id,
+            '➕ Add a new secret:\n\n/add_secret SECRET_NAME secret_value'
+          );
           return;
         }
 
@@ -120,8 +150,7 @@ export class TelegramApprovalBot {
         if (action === 'approve') {
           console.log(`👆 [${new Date().toISOString()}] Approval button clicked for ${requestId}`);
           const approvalLevel = (level as 'once' | 'trust_code' | '24h' | 'forever') || 'once';
-          
-          // If trust_code, mark code as trusted permanently
+
           if (approvalLevel === 'trust_code') {
             const request = this.db.getRequest(requestId);
             if (request) {
@@ -129,70 +158,36 @@ export class TelegramApprovalBot {
               console.log(`🔒 Code trusted: ${request.code_hash.substring(0, 16)}...`);
             }
           }
-          
-          // Mark original message as approved (keep it visible)
-          try {
-            await this.bot.editMessageReplyMarkup(
-              { inline_keyboard: [] }, // Remove buttons
-              {
-                chat_id: query.message!.chat.id,
-                message_id: query.message!.message_id
-              }
-            );
-          } catch (e) {
-            // Editing failed, that's okay
-          }
-          
+
+          const reqMsg = this.requestMessages.get(requestId);
+          const msgId = query.message!.message_id;
+          const chatId = query.message!.chat.id;
+
           // Check if any required secrets are missing
           const requiredSecrets = this.requestMetadata.get(requestId) || [];
           const missingSecrets = requiredSecrets.filter(name => !this.secretStore[name]);
-          
+
           if (missingSecrets.length > 0) {
-            // Send new message prompting for secret
             const secretName = missingSecrets[0];
-            const keyboard = {
-              inline_keyboard: [
-                [
-                  { text: `🔑 Add ${secretName}`, callback_data: `add_secret:${secretName}:${requestId}` }
-                ]
-              ]
-            };
-            
-            const sent = await this.bot.sendMessage(
-              query.message!.chat.id,
-              `✅ Approved (${approvalLevel})\n\n🔑 Secret Required: ${secretName}\n\nRequest: ${requestId}\n\nClick below to add it, then execution will proceed automatically.`,
-              {
-                reply_markup: keyboard
-              }
-            );
-            
-            // Store pending approval with the new message ID
+            // Edit original message to show approval + secret prompt
+            await this.editRequestMessage(requestId, `\n\n✅ Approved (${approvalLevel})\n🔑 Need secret: ${secretName}`, {
+              inline_keyboard: [[
+                { text: `🔑 Add ${secretName}`, callback_data: `add_secret:${secretName}:${requestId}` }
+              ]]
+            });
+
             this.pendingApprovals.set(requestId, {
-              requestId,
-              level: approvalLevel,
-              messageId: sent.message_id,
-              requiredSecrets: missingSecrets
+              requestId, level: approvalLevel, messageId: msgId, requiredSecrets: missingSecrets
             });
-            
-            await this.bot.answerCallbackQuery(query.id, {
-              text: `Approved - secret ${secretName} required`
-            });
+
+            await this.bot.answerCallbackQuery(query.id, { text: `Need secret: ${secretName}` });
             return;
           }
-          
-          // All secrets available - proceed with execution
+
+          // All secrets available - edit to show executing, then proceed
+          await this.editRequestMessage(requestId, `\n\n✅ Approved (${approvalLevel}) — executing...`);
           this.onApproval(requestId, approvalLevel);
-          
-          await this.bot.sendMessage(
-            query.message!.chat.id,
-            `✅ Approved (${approvalLevel})\n\nRequest: ${requestId}\nExecuting...`
-          );
-          
-          await this.bot.answerCallbackQuery(query.id, {
-            text: `Approved - executing`
-          });
-          
-          // Notify agent via cron wake
+          await this.bot.answerCallbackQuery(query.id, { text: `Executing` });
           await this.notifyAgent(`Execution approved (${approvalLevel}): ${requestId}`);
         } else if (action === 'deny') {
           this.onDenial(requestId);
@@ -248,66 +243,28 @@ export class TelegramApprovalBot {
           // Check if there are pending approvals waiting for this secret
           let executedAny = false;
           for (const [requestId, pending] of this.pendingApprovals.entries()) {
-            if (pending.requiredSecrets.includes(secretName)) {
-              // Remove buttons from the secret prompt message
-              try {
-                await this.bot.editMessageReplyMarkup(
-                  { inline_keyboard: [] },
-                  {
-                    chat_id: msg.chat.id,
-                    message_id: pending.messageId
-                  }
-                );
-              } catch (e) {
-                // Editing failed, that's okay
-              }
-              
-              // Check if all secrets are now available
-              const stillMissing = pending.requiredSecrets.filter(name => !this.secretStore[name]);
-              
-              if (stillMissing.length === 0) {
-                // All secrets available - execute!
-                this.pendingApprovals.delete(requestId);
-                this.onApproval(requestId, pending.level);
-                
-                await this.bot.sendMessage(
-                  msg.chat.id,
-                  `✅ Secret added: ${secretName}\n\nRequest: ${requestId}\nExecuting...`
-                );
-                
-                await this.notifyAgent(`Execution approved (${pending.level}): ${requestId}`);
-                executedAny = true;
-              } else {
-                // Still missing other secrets - send new prompt
-                const nextSecret = stillMissing[0];
-                const keyboard = {
-                  inline_keyboard: [
-                    [
-                      { text: `🔑 Add ${nextSecret}`, callback_data: `add_secret:${nextSecret}:${requestId}` }
-                    ]
-                  ]
-                };
-                
-                const sent = await this.bot.sendMessage(
-                  msg.chat.id,
-                  `✅ Added: ${secretName}\n\n🔑 Still need: ${nextSecret}\n\nRequest: ${requestId}\n\nClick below to add it.`,
-                  {
-                    reply_markup: keyboard
-                  }
-                );
-                
-                // Update pending approval with new message ID
-                pending.messageId = sent.message_id;
-              }
+            if (!pending.requiredSecrets.includes(secretName)) continue;
+
+            const stillMissing = pending.requiredSecrets.filter(name => !this.secretStore[name]);
+
+            if (stillMissing.length === 0) {
+              this.pendingApprovals.delete(requestId);
+              await this.editRequestMessage(requestId, `\n\n✅ Approved (${pending.level}) — executing...`);
+              this.onApproval(requestId, pending.level);
+              await this.notifyAgent(`Execution approved (${pending.level}): ${requestId}`);
+              executedAny = true;
+            } else {
+              const nextSecret = stillMissing[0];
+              await this.editRequestMessage(requestId, `\n\n✅ Approved (${pending.level})\n🔑 Need secret: ${nextSecret}`, {
+                inline_keyboard: [[
+                  { text: `🔑 Add ${nextSecret}`, callback_data: `add_secret:${nextSecret}:${requestId}` }
+                ]]
+              });
             }
           }
-          
-          if (!executedAny) {
-            // No pending approvals - just confirm
-            await this.bot.sendMessage(
-              msg.chat.id,
-              `✅ Secret added: ${secretName}\n\nYou can now approve execution requests that need it.`
-            );
+
+          if (!executedAny && this.pendingApprovals.size === 0) {
+            await this.bot.sendMessage(msg.chat.id, `✅ Secret added: ${secretName}`);
           }
         }
         return;
@@ -320,8 +277,12 @@ export class TelegramApprovalBot {
         );
       } else if (msg.text?.startsWith('/add_secret ')) {
         await this.handleAddSecret(msg);
-      } else if (msg.text === '/list_secrets') {
-        await this.handleListSecrets(msg);
+      } else if (msg.text === '/list_secrets' || msg.text === '/secrets') {
+        await this.handleSecretsMenu(msg);
+      } else if (msg.text?.startsWith('/delete_secret ')) {
+        await this.handleDeleteSecret(msg);
+      } else if (msg.text?.startsWith('/end_session')) {
+        await this.handleEndSession(msg);
       }
     });
   }
@@ -337,7 +298,8 @@ export class TelegramApprovalBot {
       timeout: number;
     },
     codeHash: string,
-    args?: Record<string, any>
+    args?: Record<string, any>,
+    analysis?: string
   ): Promise<number> {
     console.log(`📤 [${new Date().toISOString()}] Sending Telegram approval request for ${requestId}`);
     
@@ -384,7 +346,7 @@ ${codeLink}
 💬 <a href="${escHtml(claudeLink)}">Discuss in Claude</a>
 
 Description: ${metadata.description}
-
+${analysis ? `\n🤖 <b>Haiku Analysis:</b>\n<pre>${escHtml(analysis)}</pre>` : ''}
 Hash: ${codeHash.substring(0, 16)}...`;
 
     // Check if code is already trusted (for keyboard)
@@ -417,6 +379,7 @@ Hash: ${codeHash.substring(0, 16)}...`;
       disable_web_page_preview: true
     });
 
+    this.requestMessages.set(requestId, { messageId: sent.message_id, baseText: message });
     console.log(`✅ [${new Date().toISOString()}] Telegram message sent (message_id: ${sent.message_id})`);
     return sent.message_id;
   }
@@ -425,53 +388,46 @@ Hash: ${codeHash.substring(0, 16)}...`;
     try {
       const status = result.success ? '✅ Success' : '❌ Failed';
       const duration = result.duration ? `${result.duration}ms` : 'N/A';
-      
-      // Log execution result to console
-      console.log('\n📊 Execution Result:');
-      console.log(`  Status: ${status}`);
-      console.log(`  Duration: ${duration}`);
-      if (result.stdout) console.log(`  Stdout: ${result.stdout}`);
-      if (result.stderr) console.log(`  Stderr: ${result.stderr}`);
-      if (result.error) console.log(`  Error: ${result.error}`);
-      
-      // Get original message to preserve context
-      let originalMessage = '';
-      try {
-        const msg = await this.bot.getChat(this.chatId);
-        // Can't easily get message text, so we'll send a separate result message instead
-      } catch (e) {
-        // Fallback
-      }
-      
-      // Build result section
-      let resultSection = `\n\n━━━━━━━━━━━━━━━━━━━━\n${status}\nDuration: ${duration}`;
-      
+
+      let suffix = `\n\n${status} (${duration})`;
       if (result.success && result.stdout) {
-        const output = result.stdout.substring(0, 400);
-        resultSection += `\n\nOutput:\n${output}`;
-        if (result.stdout.length > 400) {
-          resultSection += `\n... (truncated)`;
-        }
+        const output = result.stdout.substring(0, 300);
+        suffix += `\n<pre>${this.esc(output)}${result.stdout.length > 300 ? '\n...' : ''}</pre>`;
       } else if (result.error) {
-        // Shorten error for readability
-        const shortError = result.error.length > 200 
-          ? result.error.substring(0, 200) + '...' 
-          : result.error;
-        resultSection += `\n\nError:\n${shortError}`;
+        const short = result.error.substring(0, 200);
+        suffix += `\n<pre>${this.esc(short)}${result.error.length > 200 ? '...' : ''}</pre>`;
       }
-      
-      // Send as new message to preserve context
-      await this.bot.sendMessage(this.chatId, resultSection, {
-        reply_to_message_id: messageId
-      });
-      
-      // Notify agent of completion
-      const notificationText = result.success 
-        ? `Execution completed successfully: ${requestId} (${duration})`
+
+      await this.editRequestMessage(requestId, suffix);
+
+      const notif = result.success
+        ? `Execution completed: ${requestId} (${duration})`
         : `Execution failed: ${requestId} - ${result.error || 'Unknown error'}`;
-      await this.notifyAgent(notificationText);
+      await this.notifyAgent(notif);
     } catch (error) {
       console.error('Failed to update message:', error);
+    }
+  }
+
+  private esc(s: string): string {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  private async editRequestMessage(requestId: string, appendText: string, replyMarkup?: any): Promise<void> {
+    const reqMsg = this.requestMessages.get(requestId);
+    if (!reqMsg) return;
+
+    reqMsg.baseText += appendText;
+    try {
+      await this.bot.editMessageText(reqMsg.baseText, {
+        chat_id: this.chatId,
+        message_id: reqMsg.messageId,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        reply_markup: replyMarkup || { inline_keyboard: [] }
+      });
+    } catch (e) {
+      console.error('Failed to edit message:', e);
     }
   }
 
@@ -515,56 +471,173 @@ Hash: ${codeHash.substring(0, 16)}...`;
     }
   }
 
-  private async handleListSecrets(msg: TelegramBot.Message): Promise<void> {
+  private secretsMenuKeyboard(): TelegramBot.InlineKeyboardMarkup {
+    const secretNames = Object.keys(this.secretStore);
+    const rows = secretNames.map(name => [
+      { text: `🔄 ${name}`, callback_data: `replace_secret:${name}` },
+      { text: `🗑`, callback_data: `delete_secret:${name}` }
+    ]);
+    rows.push([{ text: '➕ Add New', callback_data: 'add_new_secret:' }]);
+    return { inline_keyboard: rows };
+  }
+
+  private async handleSecretsMenu(msg: TelegramBot.Message): Promise<void> {
+    const secretNames = Object.keys(this.secretStore);
+    if (secretNames.length === 0) {
+      await this.bot.sendMessage(msg.chat.id, '📋 No secrets stored.\n\n/add_secret SECRET_NAME value');
+      return;
+    }
+    await this.bot.sendMessage(msg.chat.id,
+      `📋 Secrets (${secretNames.length}):`, {
+      reply_markup: this.secretsMenuKeyboard()
+    });
+  }
+
+  private async refreshSecretsMenu(msg: TelegramBot.Message): Promise<void> {
+    const secretNames = Object.keys(this.secretStore);
+    const text = secretNames.length === 0
+      ? '📋 No secrets stored.'
+      : `📋 Secrets (${secretNames.length}):`;
     try {
-      const secretNames = Object.keys(this.secretStore);
-      
-      if (secretNames.length === 0) {
-        await this.bot.sendMessage(
-          msg.chat.id,
-          '📋 No secrets stored.\n\nAdd one with:\n/add_secret SECRET_NAME secret_value'
-        );
-        return;
-      }
-      
-      const list = secretNames.map(name => `• ${name}`).join('\n');
-      await this.bot.sendMessage(
-        msg.chat.id,
-        `📋 Stored secrets (${secretNames.length}):\n\n${list}\n\n✅ Persisted to database`
-      );
-    } catch (error) {
-      console.error('Error listing secrets:', error);
-      await this.bot.sendMessage(msg.chat.id, '❌ Failed to list secrets');
+      await this.bot.editMessageText(text, {
+        chat_id: msg.chat.id,
+        message_id: msg.message_id,
+        reply_markup: secretNames.length > 0 ? this.secretsMenuKeyboard() : undefined
+      });
+    } catch (e) {
+      console.error('Failed to refresh secrets menu:', e);
     }
   }
 
-  async requestSecret(requestId: string, secretName: string): Promise<void> {
-    try {
-      const message = `🔑 Missing Secret Required
-
-Request: ${requestId}
-Secret: ${secretName}
-
-Click the button below to add this secret securely.
-
-After adding the secret, the execution will automatically retry.`;
-
-      const keyboard = {
-        inline_keyboard: [
-          [
-            { text: `🔑 Add ${secretName}`, callback_data: `add_secret:${secretName}` }
-          ]
-        ]
-      };
-
-      await this.bot.sendMessage(this.chatId, message, {
-        reply_markup: keyboard
-      });
-      
-      console.log(`📨 Requested secret ${secretName} for ${requestId}`);
-    } catch (error) {
-      console.error('Error requesting secret:', error);
+  private async handleDeleteSecret(msg: TelegramBot.Message): Promise<void> {
+    const name = (msg.text || '').split(' ')[1];
+    if (!name) {
+      await this.bot.sendMessage(msg.chat.id, '❌ Usage: /delete_secret SECRET_NAME');
+      return;
     }
+    if (!this.secretStore[name]) {
+      await this.bot.sendMessage(msg.chat.id, `❌ Secret not found: ${name}`);
+      return;
+    }
+    delete this.secretStore[name];
+    this.db.deleteSecret(name);
+    await this.bot.sendMessage(msg.chat.id, `🗑 Deleted: ${name}`);
+    console.log(`🗑 Secret deleted via Telegram: ${name}`);
+  }
+
+  async requestSecret(requestId: string, secretName: string, allMissing?: string[]): Promise<void> {
+    const missing = allMissing || [secretName];
+    // Edit original message inline + register pending so secret addition resumes execution
+    await this.editRequestMessage(requestId, `\n\n🔑 Need secret: ${secretName}`, {
+      inline_keyboard: [[
+        { text: `🔑 Add ${secretName}`, callback_data: `add_secret:${secretName}:${requestId}` }
+      ]]
+    });
+
+    // Register as pending so secret-add handler can resume execution
+    const reqMsg = this.requestMessages.get(requestId);
+    if (reqMsg) {
+      this.pendingApprovals.set(requestId, {
+        requestId, level: 'once', messageId: reqMsg.messageId, requiredSecrets: missing
+      });
+    }
+
+    console.log(`📨 Requested secret ${secretName} for ${requestId}`);
+  }
+
+  async sendApprovalLink(
+    requestId: string,
+    skillId: string,
+    metadata: { description: string; secrets: string[]; network: string[]; timeout: number },
+    approvalUrl: string,
+    analysis?: string
+  ): Promise<number> {
+    const escHtml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+    const message = `🔐 Approval needed
+
+Skill: ${skillId}
+Secrets: ${metadata.secrets.join(', ') || 'none'}
+Network: ${metadata.network.join(', ') || 'none'}
+${analysis ? `\n🤖 ${escHtml(analysis).substring(0, 200)}` : ''}
+
+👉 <a href="${escHtml(approvalUrl)}">Review &amp; Approve</a>`;
+
+    const sent = await this.bot.sendMessage(this.chatId, message, {
+      parse_mode: 'HTML',
+      disable_web_page_preview: true
+    });
+    this.requestMessages.set(requestId, { messageId: sent.message_id, baseText: message });
+    this.requestMetadata.set(requestId, metadata.secrets);
+    return sent.message_id;
+  }
+
+  async sendSessionStartNotification(sessionId: string, policy: SessionPolicy): Promise<void> {
+    const msg = `📋 Session started: ${sessionId.substring(0, 16)}...
+
+Auto-approving similar skills for 2h:
+• Secrets: ${policy.allowedSecrets.join(', ') || 'none'}
+• Network: ${policy.allowedNetworks.join(', ') || 'none'}
+• Mutating: ${policy.allowMutating ? 'yes' : 'no'}
+• Max risk: ${policy.maxRiskLevel}
+
+/end_session ${sessionId} to stop`;
+
+    await this.bot.sendMessage(this.chatId, msg, { disable_notification: true });
+  }
+
+  async sendSessionAutoApproveNotification(
+    requestId: string, skillId: string, metadata: any, codeHash: string,
+    sessionId: string, analysis: any
+  ): Promise<number> {
+    const msg = `⚡ Auto-approved (session)
+
+Skill: ${skillId}
+Hash: ${codeHash.substring(0, 16)}...
+Session: ${sessionId.substring(0, 16)}...
+Risk: ${analysis.riskLevel}
+
+${metadata.description || ''}`;
+
+    const sent = await this.bot.sendMessage(this.chatId, msg, {
+      disable_notification: true,
+      disable_web_page_preview: true
+    });
+    this.requestMessages.set(requestId, { messageId: sent.message_id, baseText: msg });
+    return sent.message_id;
+  }
+
+  private async handleEndSession(msg: TelegramBot.Message): Promise<void> {
+    const sessionId = (msg.text || '').split(' ')[1];
+    if (!sessionId) {
+      await this.bot.sendMessage(msg.chat.id, '❌ Usage: /end_session SESSION_ID');
+      return;
+    }
+    const session = this.db.getSession(sessionId);
+    if (!session) {
+      await this.bot.sendMessage(msg.chat.id, `❌ Session not found or expired: ${sessionId.substring(0, 16)}...`);
+      return;
+    }
+    this.db.deleteSession(sessionId);
+    await this.bot.sendMessage(msg.chat.id, `🛑 Session ended: ${sessionId.substring(0, 16)}...`);
+  }
+
+  async sendAutoApproveNotification(requestId: string, skillId: string, metadata: any, codeHash: string): Promise<number> {
+    const msg = `⚡ Auto-approved (trusted)
+
+Skill: ${skillId}
+Hash: ${codeHash.substring(0, 16)}...
+Secrets: ${metadata.secrets?.join(', ') || 'none'}
+Network: ${metadata.network?.join(', ') || 'none'}
+
+${metadata.description || ''}`;
+
+    const sent = await this.bot.sendMessage(this.chatId, msg, {
+      disable_notification: true,
+      disable_web_page_preview: true
+    });
+    this.requestMessages.set(requestId, { messageId: sent.message_id, baseText: msg });
+    return sent.message_id;
   }
 
   stop(): void {
