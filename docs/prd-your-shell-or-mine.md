@@ -91,6 +91,32 @@ Agent loads data → attested CVM → runs count/validation → returns attested
 
 This is how the merchant builds reputation without exposing inventory.
 
+## Data Authenticity
+
+Attestation proves the query ran honestly. It says nothing about whether the data is honest. These are two different trust problems, and which one matters depends on the buyer's use case.
+
+### When authenticity doesn't matter
+
+High-value niche queries are self-authenticating. "How did someone debug dstack DNS race conditions in a TEE?" — the answer's value is self-evident from its specificity and depth. If it's useful, it's useful. You're selling expertise-as-data, and fabricating useful expertise is harder than having it. The dataset description *is* the authentication: "dstack debugging logs from a research engineer" — the buyer evaluates the results, not the provenance.
+
+### When authenticity matters
+
+Market research and census use cases — "What's the average Claude Code session length across 100 developers?" — are vulnerable to junk data. Someone could feed synthetic logs to collect payment without contributing real data. Or heavily curate their logs to remove embarrassing patterns. The aggregate is only as good as the individual contributions.
+
+### Attested authenticity heuristics
+
+The framework handles this naturally: the authenticity check runs inside the attested CVM, alongside the query. The buyer doesn't see raw data but gets an attested confidence score.
+
+Heuristics the interaction server can run:
+- **Statistical signatures** — real usage is messy (irregular timing, error bursts, variable session lengths). Synthetic data is too clean, too uniform.
+- **Cross-correlation** — do file paths reference real repos? Do tool call sequences follow realistic patterns? (Edit after Read, not Edit out of nowhere.)
+- **Freshness** — timestamps consistent with claimed time range? Reasonable timezone patterns?
+- **Density** — real logs have idle gaps, weekends, sleep hours. Fabricated logs are suspiciously uniform.
+
+The result: query response includes `authenticity_score: 0.87` with a breakdown of what was checked, all under the same TDX attestation. The buyer knows the check actually ran — they don't have to trust the seller's self-assessment.
+
+This isn't cryptographic proof of authenticity (that would require signed logs from the Claude Code client itself). But it's an *attested heuristic* — the buyer knows the specific checks that ran, verified by hardware attestation, which is far better than trusting the seller's word.
+
 ## Architecture
 
 ```
