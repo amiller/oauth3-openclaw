@@ -1,472 +1,95 @@
 # OAuth3-OpenClaw
 
-**Human-approved secret management and execution sandbox for OpenClaw agents.**
-
-OAuth3-OpenClaw provides a secure execution proxy that enables AI agents to request access to secrets (API keys, tokens, credentials) with explicit human approval via Telegram. The agent submits code for execution, you review and approve via inline buttons, and the proxy runs the code in an isolated Docker sandbox with time-limited secret access.
-
-🔗 **GitHub:** https://github.com/claw-tee-dah/oauth3-openclaw
-📋 **Status:** ✅ Fully functional (see [TESTING-RESULTS.md](./TESTING-RESULTS.md))
-📖 **Host Setup:** See [DEPLOYMENT.md](./DEPLOYMENT.md) for step-by-step instructions
-
-<p align="center">
-  <img src="images/skill-code-gist.jpeg" width="520" alt="Skill code hosted on GitHub Gist — a constrained Claude query using Deno">
-  <img src="images/telegram-approval.jpeg" width="300" alt="Telegram approval flow with Run Once, Deny, and Trust Code buttons">
-</p>
-<p align="center"><em>Left: Agent skill code on a GitHub Gist. Right: Human approval via Telegram with one-tap Run Once / Deny / Trust Code.</em></p>
-
-## Why OAuth3?
-
-Traditional OAuth requires the service provider to implement flows and trust boundaries. **OAuth3** inverts this: the **resource owner** (you) runs the authorization server, and agents request delegated access through human approval. Think of it as "OAuth for AI agents where you are the provider."
-
-Key properties:
-- **Human in the loop**: Every execution requires your explicit approval
-- **Real isolation**: Agent never receives plaintext secrets (when possible)
-- **Trust levels**: Approve once, trust for 24h, or always trust based on code hash
-- **Auditable**: All requests and approvals logged to SQLite
-- **Agent notifications**: Automatic cron wake events notify your agent of approval/denial
-
-## Agent-First Workflow
-
-**The agent initiates, the human approves.** This is the core pattern:
-
-1. **Agent decides it needs to execute code** requiring secrets (API keys, tokens, credentials)
-2. **Agent calls `/execute` endpoint** with code URL, parameters, and required secrets list
-3. **Proxy sends approval request to Telegram** with inline buttons
-4. **If secrets are missing**: Bot prompts human to add them (with auto-deleting messages for security)
-5. **Human reviews and approves** (Run Once / Trust 24h / Always Trust / Deny)
-6. **Proxy executes in Docker sandbox** with secrets injected as environment variables
-7. **Proxy sends result back** to agent and notifies via cron wake event
-
-**Key point**: The agent doesn't ask "do you have an API key?" or "can I use this?" — it just attempts the operation. The proxy handles the human approval flow automatically.
-
-## Architecture
+Programmable API gateway running in a TEE. Agents submit code for execution, humans approve scopes via web UI, and Haiku reviews each invocation against natural-language constraints.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Agent (Multipass VM)                                       │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │ OpenClaw Agent                                        │  │
-│  │   - Prepares execution request (code + secrets list)  │  │
-│  │   - Sends POST /execute to proxy                      │  │
-│  │   - Waits for cron wake notification                  │  │
-│  │   - Never receives plaintext secrets                  │  │
-│  └───────────────────────────────────────────────────────┘  │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ HTTP (10.x.x.1:3737)
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Host Machine                                               │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │ OAuth3 Execution Proxy                                │  │
-│  │   - Receives execution request                        │  │
-│  │   - Computes code hash                                │  │
-│  │   - Checks trust DB (hash-based approval)             │  │
-│  │   - Sends Telegram approval request                   │  │
-│  │   - On approval: creates Docker sandbox               │  │
-│  │   - Injects secrets as environment variables          │  │
-│  │   - Executes code with network restrictions           │  │
-│  │   - Sends cron wake to agent                          │  │
-│  │   - Returns result                                    │  │
-│  │   - Destroys sandbox                                  │  │
-│  └───────────────────────────────────────────────────────┘  │
-│                          │                                   │
-│                          │ Telegram Bot API                  │
-│                          ▼                                   │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │ You (via Telegram)                                    │  │
-│  │   - Receive approval request with inline buttons      │  │
-│  │   - Click: Run Once / Trust 24h / Always Trust / Deny │  │
-│  │   - View code on GitHub before approving              │  │
-│  └───────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+Agent (openclaw)              Human (browser)
+    │                              │
+    ├─ POST /scope ──────────────► approval page (TEE HTTPS)
+    ├─ POST /execute ──────┐      │
+    │  (auto-approve or ◄──┘      ├─ GET /dashboard
+    │   pending)                   │
+    ▼                              ▼
+┌─────────────────────────────────────┐
+│  OAuth3 Proxy (Deno sandbox + TEE)  │
+│  ├─ Three-layer Haiku review        │
+│  ├─ Session policy management       │
+│  └─ Secret injection                │
+└─────────────────────────────────────┘
+                 │
+                 ▼
+         External APIs (GitHub, Phala, etc.)
 ```
 
-## Features
+## Development Workflow
 
-### ✅ Implemented
+Two agents collaborate through the proxy:
 
-- **Telegram approval workflow** with inline buttons
-- **Telegram secret management** - Add secrets via `/add_secret` command (see [TELEGRAM-COMMANDS.md](./TELEGRAM-COMMANDS.md))
-- **Docker sandbox execution** (Deno runtime by default)
-- **Network restrictions** (allow-list specific domains)
-- **Resource limits** (memory, CPU, timeout)
-- **Code hash verification** for trust levels
-- **SQLite storage** for approvals and audit logs
-- **OpenClaw integration** via notification system
-- **Skill metadata** (description, required secrets, network access)
+- **Claude Code** — develops the proxy, handles issues, deploys via SSH/`phala` CLI
+- **Openclaw agent** — integration-tests the proxy, co-designs scopes + skills, files issues
 
-### 🚧 Roadmap
+Both run as Docker containers on a Phala CVM connected via an `internal` bridge network. The proxy is accessible externally at its dstack HTTPS URL.
 
-**🔐 Coming Soon: Hosted TEE Service** - No setup required!
+## Key Concepts
 
-Instead of deploying your own:
-- Message **@OAuth3Bot** (shared public bot)
-- Runs in **Intel TDX TEE** with attestation
-- **Provably secure** - verify code before trusting
-- Pay-as-you-go pricing
-- Lower barrier to entry while maintaining security
+**Scopes** — An agent requests a scope (`POST /scope`) describing what it wants to do, with natural-language constraints. A human approves the scope via a web page served from the TEE.
 
-See **[ROADMAP.md](./ROADMAP.md)** for full details on the TEE-hosted service and other planned features:
-- Persistent encrypted secret storage
-- Web dashboard + mobile app  
-- Public skill marketplace
-- Multi-runtime support (Python, Node, QuickJS)
-- Enhanced security (2FA, anomaly detection)
+**Sessions** — An approved scope creates a session. Subsequent `POST /execute` calls referencing the session are auto-approved if they pass Haiku review.
 
-## dstack / Phala Cloud Deployment
+**Three-layer review** — Every execution goes through:
+1. **Static code analysis** — is this code safe? (cacheable by hash)
+2. **Constraint compliance** — does it match the session's constraints?
+3. **Argument review** — are the runtime args safe?
 
-Run oauth3-proxy as a **sidecar** alongside OpenClaw in a Phala Cloud CVM (dstack TEE). The agent reaches the proxy at `http://oauth3-proxy:3737` on the compose network. In TEE mode, Deno skills execute directly — no Docker needed, the TEE is the sandbox.
-
-```
-┌─ Phala CVM ────────────────────────────────┐
-│  openclaw ──POST──→ oauth3-proxy:3737      │
-│  (agent)            (approval + execution)  │
-└─────────────────────────────────────────────┘
-```
-
-**→ See [dstack/README.md](./dstack/README.md) for the full integration guide.**
-
-## Quick Start
-
-### 🚀 For Host (Deploy the Proxy)
-
-**→ See [DEPLOYMENT.md](./DEPLOYMENT.md) for complete step-by-step instructions.**
-
-**TL;DR:**
-```bash
-git clone https://github.com/claw-tee-dah/oauth3-openclaw.git
-cd oauth3-openclaw/proxy
-npm install
-cp .env.example .env
-# Edit .env with your Telegram bot token and chat ID
-npm run build
-npm start
-```
-
-Then configure your agent to submit requests to `http://YOUR_HOST_IP:3737/execute`
-
-### For Users (Agent Integration)
-
-See [DEPLOYMENT.md](./DEPLOYMENT.md) for agent-side setup instructions.
-
-**TL;DR:**
-1. Create a Telegram bot via @BotFather
-2. Clone this repo and run `npm install` in `proxy/`
-3. Create `.env` with bot token and chat ID
-4. Run `npm start`
-5. Agent sends execution requests to `http://host:3737/execute`
-6. You approve via Telegram, agent gets notified via cron wake
-
-### For Developers (Build & Test)
-
-```bash
-# Clone and install
-git clone https://github.com/YOUR_USERNAME/oauth3-openclaw.git
-cd oauth3-openclaw/proxy
-npm install
-
-# Set up test environment
-cp .env.example .env
-# Edit .env with your test bot token
-
-# Build TypeScript
-npm run build
-
-# Run in development mode (auto-reload)
-npm run dev
-
-# Run tests (coming soon)
-npm test
-```
+**Co-design pattern** — Write per-operation skills with hardcoded values, then write constraints that describe exactly what the code does. Haiku checks for correspondence, not minimality.
 
 ## API Reference
 
-### POST /execute
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/execute` | Submit code for execution (`skill_code` or `skill_url`) |
+| `GET` | `/execute/:id/status?wait=true` | Long-poll for result (120s timeout) |
+| `POST` | `/scope` | Request a scope with constraints |
+| `GET/POST` | `/approve/:id?token=...` | Web-based approval page |
+| `GET` | `/sessions` | List active sessions |
+| `GET` | `/sessions/:id` | Session details |
+| `DELETE` | `/sessions/:id` | Revoke a session |
+| `GET` | `/dashboard?token=...` | Web UI for browsing sessions/executions |
+| `GET` | `/health` | Health check |
+| `GET` | `/.well-known/oauth3-proxy` | Discovery endpoint |
 
-Submit code for execution with required secrets.
-
-**Request:**
-```json
-{
-  "skill_id": "openai-completion",
-  "skill_url": "https://gist.github.com/user/abc123",
-  "secrets": ["OPENAI_API_KEY"],
-  "code": "const response = await fetch('https://api.openai.com/v1/chat/completions', {\n  method: 'POST',\n  headers: {\n    'Authorization': `Bearer ${Deno.env.get('OPENAI_API_KEY')}`,\n    'Content-Type': 'application/json'\n  },\n  body: JSON.stringify({model: 'gpt-4', messages: [{role: 'user', content: 'Hello!'}]})\n});\nconsole.log(await response.json());",
-  "metadata": {
-    "description": "Send a chat completion request to OpenAI",
-    "secrets": ["OPENAI_API_KEY"],
-    "network": ["api.openai.com"],
-    "timeout": 30
-  }
-}
-```
-
-**Response (pending approval):**
-```json
-{
-  "status": "pending",
-  "request_id": "req_abc123",
-  "message": "Approval request sent to Telegram"
-}
-```
-
-**Response (auto-approved via hash trust):**
-```json
-{
-  "status": "success",
-  "request_id": "req_abc123",
-  "stdout": "{\"id\":\"chatcmpl-...\",\"choices\":[...]}",
-  "stderr": "",
-  "duration": 1234,
-  "trusted": true
-}
-```
-
-### GET /health
-
-Check proxy status.
-
-**Response:**
-```json
-{
-  "status": "ok",
-  "telegram": "connected",
-  "database": "ok"
-}
-```
-
-## Development Guide
-
-### Project Structure
-
-```
-oauth3-openclaw/
-├── proxy/                    # Execution proxy server
-│   ├── src/
-│   │   ├── server.ts        # Main Express server
-│   │   ├── telegram.ts      # Telegram bot integration
-│   │   ├── executor.ts      # Docker sandbox execution
-│   │   ├── database.ts      # SQLite storage
-│   │   └── types.ts         # TypeScript type definitions
-│   ├── dist/                # Compiled JavaScript (generated)
-│   ├── package.json
-│   └── tsconfig.json
-├── dstack/                  # Phala CVM sidecar integration
-│   ├── docker-compose-sidecar.yaml
-│   └── README.md
-├── images/                  # Screenshots
-│   ├── skill-code-gist.jpeg
-│   └── telegram-approval.jpeg
-├── docs/
-│   ├── PLAN.md              # Original design document
-│   ├── TESTING.md           # Test strategy
-│   ├── BOTMAKER-ANALYSIS.md # BotMaker pattern analysis
-│   └── NESTED-VM-ISOLATION.md
-├── DEPLOYMENT.md            # Host deployment guide
-└── README.md                # This file
-```
-
-### Building from Source
+## Deployment
 
 ```bash
-cd proxy
-npm install
-npm run build  # Compiles TypeScript to dist/
+# Build
+docker build -t ghcr.io/amiller/oauth3-proxy:latest -f proxy/Dockerfile proxy/
+
+# Push
+docker push ghcr.io/amiller/oauth3-proxy:latest
+
+# Update digest in deploy/docker-compose.yml, then:
+phala deploy --cvm-id <VM_UUID> -c deploy/docker-compose.yml -e deploy/.env --wait
 ```
 
-### Development Mode
+## Project Structure
 
-Auto-recompile on file changes:
-```bash
-npm run dev
 ```
-
-Or use `tsc --watch` in a separate terminal:
-```bash
-npx tsc --watch  # Terminal 1
-npm start        # Terminal 2 (restart manually on changes)
+proxy/src/
+├── server.ts      # Express server, routes, approval pages, dashboard
+├── analyzer.ts    # Three-layer Haiku review (static + constraints + args)
+├── executor.ts    # Deno sandbox execution
+├── database.ts    # SQLite storage (sessions, executions, secrets)
+├── telegram.ts    # Optional Telegram bot integration
+└── types.ts       # TypeScript types
+deploy/
+├── docker-compose.yml  # Phala CVM deployment config
+├── .env                # Environment variables
+└── ssh-cvm.sh          # SSH helper for CVM access
+docs/
+├── gnap-positioning.md       # GNAP/RFC 9635 positioning
+└── prd-your-shell-or-mine.md # Future prototype PRD
 ```
-
-### Adding a New Runtime
-
-The executor currently supports Deno. To add support for Node, Python, or other runtimes:
-
-1. Edit `src/executor.ts`
-2. Add a new `execute${Runtime}` method
-3. Create appropriate Docker image (see `Dockerfile.deno` example)
-4. Update `executeCode()` to dispatch based on skill metadata
-
-Example for Node.js:
-```typescript
-private async executeNode(
-  code: string,
-  secrets: Record<string, string>,
-  metadata: ExecutionMetadata
-): Promise<ExecutionResult> {
-  const image = 'node:22-alpine';
-  const env = Object.entries(secrets)
-    .map(([k, v]) => `--env ${k}="${v}"`)
-    .join(' ');
-  
-  // Write code to temp file
-  const tmpFile = `/tmp/skill-${Date.now()}.js`;
-  await fs.writeFile(tmpFile, code);
-  
-  const cmd = `docker run --rm ${env} --network none -v ${tmpFile}:/app/script.js ${image} node /app/script.js`;
-  // ... execute and handle result
-}
-```
-
-### Database Schema
-
-The proxy uses SQLite with three main tables:
-
-**secrets** - Encrypted secret storage
-```sql
-CREATE TABLE secrets (
-  id INTEGER PRIMARY KEY,
-  name TEXT UNIQUE NOT NULL,
-  encrypted_value TEXT NOT NULL,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-```
-
-**approvals** - Trust levels by code hash
-```sql
-CREATE TABLE approvals (
-  id INTEGER PRIMARY KEY,
-  skill_id TEXT NOT NULL,
-  code_hash TEXT NOT NULL,
-  trust_level TEXT CHECK(trust_level IN ('once', '24h', 'forever')),
-  approved_at INTEGER NOT NULL,
-  expires_at INTEGER,
-  UNIQUE(skill_id, code_hash)
-);
-```
-
-**executions** - Audit log
-```sql
-CREATE TABLE executions (
-  id INTEGER PRIMARY KEY,
-  request_id TEXT UNIQUE NOT NULL,
-  skill_id TEXT NOT NULL,
-  code_hash TEXT NOT NULL,
-  status TEXT CHECK(status IN ('pending', 'approved', 'denied', 'success', 'failed')),
-  approved BOOLEAN DEFAULT FALSE,
-  executed_at INTEGER,
-  duration_ms INTEGER,
-  result TEXT,
-  created_at INTEGER NOT NULL
-);
-```
-
-### Testing Tips
-
-1. **Test bot locally first**: Use a personal bot token and send `/start` before integrating with agents
-2. **Mock Docker in tests**: Use `docker run hello-world` to verify Docker access without secrets
-3. **Test approval flow**: Send a request, approve via Telegram, verify agent receives cron wake
-4. **Check isolation**: Try to escape the sandbox (you shouldn't be able to)
-5. **Test trust levels**: 
-   - Run same code twice → first requires approval, second is auto-approved (24h)
-   - Change one character → new hash, requires re-approval
-   - Always-trust → survives restarts
-
-### Debugging
-
-**Enable verbose logging:**
-```bash
-DEBUG=* npm start
-```
-
-**Check Docker sandbox logs:**
-```bash
-docker ps -a  # Find recent containers
-docker logs <container_id>
-```
-
-**Inspect database:**
-```bash
-sqlite3 proxy.db
-.tables
-SELECT * FROM executions ORDER BY created_at DESC LIMIT 10;
-```
-
-**Test cron wake manually:**
-```bash
-openclaw cron wake --text "Test notification" --mode now
-```
-
-## Security Model
-
-### Threat Model
-
-**What we protect against:**
-- ✅ Agent stealing secrets directly (secrets stored encrypted, injected at runtime)
-- ✅ Agent running untrusted code without approval (human in the loop)
-- ✅ Agent accessing network resources not explicitly allowed (Docker network restrictions)
-- ✅ Agent consuming excessive resources (memory/CPU/time limits)
-- ✅ Replay attacks (code hash verification, time-limited trust)
-
-**What we DON'T protect against:**
-- ❌ Agent social engineering the human into approving malicious code (always review!)
-- ❌ Compromised Docker daemon (proxy needs Docker socket access = root equivalent)
-- ❌ Side-channel attacks (not a TEE, just process isolation)
-- ❌ Secrets leaked in execution output (agent sees stdout/stderr)
-
-### Isolation Boundaries
-
-1. **Agent ↔ Proxy**: Network boundary (VM to host). Agent cannot access proxy's filesystem or SQLite DB.
-2. **Proxy ↔ Sandbox**: Docker container with no volume mounts (except code), restricted network, read-only filesystem (when possible).
-3. **Sandbox ↔ External APIs**: Network allow-list enforced via Docker DNS + iptables.
-
-### Trust Assumptions
-
-- **You trust the proxy**: It runs on your host with Docker access (root equivalent).
-- **You trust your Telegram account**: Anyone with access can approve executions.
-- **You trust the code you approve**: Always review before clicking "Run Once" or "Always Trust".
-- **You trust Docker isolation**: This is standard Linux container isolation, not hardware TEE.
-
-## Future: BotMaker Pattern for LLM APIs
-
-The current implementation focuses on general code execution. A future version will support the **BotMaker pattern** for LLM API proxying:
-
-**How it works:**
-1. Agent sends request to proxy with: `Authorization: Bearer bot_proxy_token`
-2. Proxy validates token (SHA256 lookup in DB)
-3. Proxy decrypts real API key
-4. Proxy **removes** agent's Authorization header
-5. Proxy **adds** real header: `Authorization: Bearer sk-real-openai-key`
-6. Proxy forwards to upstream API
-7. Agent receives response (never sees real key)
-
-**Benefits:**
-- Works for 22+ LLM providers (OpenAI, Anthropic, Google, Groq, DeepSeek, Mistral, etc.)
-- No code execution needed (just HTTP header rewriting)
-- Agent can make multiple API calls with one approval
-- Upstream API never knows it's an agent (no special integration required)
-
-See `docs/BOTMAKER-ANALYSIS.md` for full details.
-
-## Contributing
-
-Contributions welcome! Please:
-1. Read the code of conduct (coming soon)
-2. Check existing issues and discussions
-3. Open an issue before major changes
-4. Include tests with PRs
-5. Follow existing code style
 
 ## License
 
-MIT - see LICENSE file
-
-## Credits
-
-- **BotMaker pattern**: Inspired by [@jgarzik/botmaker](https://github.com/jgarzik/botmaker)
-- **OpenClaw**: Built for the [OpenClaw](https://openclaw.ai) agent framework
-- **OAuth3 concept**: Extending OAuth principles to agent authorization
-
----
-
-Built with ☕ by AI agents, for AI agents (with human supervision).
+MIT
