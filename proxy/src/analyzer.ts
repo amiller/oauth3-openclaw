@@ -3,6 +3,17 @@ import { SkillMetadata } from './executor.js'
 
 const client = new Anthropic()
 
+// Token usage tracking
+export const tokenUsage = { calls: 0, inputTokens: 0, outputTokens: 0 }
+function trackUsage(label: string, msg: any) {
+  const u = msg.usage
+  if (!u) return
+  tokenUsage.calls++
+  tokenUsage.inputTokens += u.input_tokens || 0
+  tokenUsage.outputTokens += u.output_tokens || 0
+  console.log(`  🪙 ${label}: ${u.input_tokens}in/${u.output_tokens}out (total: ${tokenUsage.inputTokens}in/${tokenUsage.outputTokens}out, ${tokenUsage.calls} calls)`)
+}
+
 function stripFences(text: string): string {
   return text.replace(/^```(?:json)?\n?/m, '').replace(/\n?```$/m, '').trim()
 }
@@ -65,6 +76,7 @@ Timeout: ${metadata.timeout}s
 ${code}
 \`\`\`` }]
   })
+  trackUsage('analyzeCode', msg)
 
   const text = msg.content[0].type === 'text' ? msg.content[0].text : '{}'
   const parsed = parseHaikuJson(text, { summary: text, secretsUsed: [], networkTargets: [], isMutating: true, riskLevel: 'medium', concerns: ['Could not parse structured analysis'] })
@@ -136,6 +148,7 @@ ${code}
 \`\`\`` }]
   })
 
+  trackUsage('reviewCode', msg)
   const text = msg.content[0].type === 'text' ? msg.content[0].text : '{}'
   const parsed = parseHaikuJson(text, { faithful: false, parameterized: [], hardcoded: {}, concerns: ['Could not parse code review'] })
 
@@ -202,18 +215,62 @@ ${Object.entries(args).map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join('\n') 
     messages: [{ role: 'user', content: userContent }]
   })
 
+  trackUsage('reviewInvocation', msg)
   const text = msg.content[0].type === 'text' ? msg.content[0].text : '{}'
   const parsed = parseHaikuJson(text, null)
   if (!parsed) return { compliant: false, violations: ['Could not parse invocation review — treating as non-compliant'] }
   return { compliant: !!parsed.compliant, violations: parsed.violations || [] }
 }
 
-// --- Legacy combined check (fallback when no args) ---
+// --- Args review (for pre-approved code: check args against constraints) ---
 
 export interface PolicyCompliance {
   compliant: boolean
   violations: string[]
 }
+
+const ARGS_REVIEW_SYSTEM = `You are checking whether specific argument values comply with pre-approved policy constraints.
+
+The code has already been reviewed and approved by a human. You only need to check whether these specific argument values stay within the approved constraints.
+
+Return ONLY a JSON object:
+{
+  "compliant": true/false,
+  "violations": ["constraint violated and why"]
+}
+
+Rules:
+- The code is already approved — do not re-review it
+- Only check whether the argument values violate any constraint
+- If all args are within bounds, return compliant: true
+Return ONLY JSON, no markdown fences.`
+
+export async function reviewArgs(
+  analysisSummary: string, constraints: string[], args: Record<string, any>
+): Promise<PolicyCompliance> {
+  if (!constraints.length) return { compliant: true, violations: [] }
+
+  const msg = await client.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 512,
+    system: ARGS_REVIEW_SYSTEM,
+    messages: [{ role: 'user', content: `Pre-approved code summary: ${analysisSummary}
+
+Policy constraints:
+${constraints.map((c, i) => `${i + 1}. ${c}`).join('\n')}
+
+Invocation arguments:
+${Object.entries(args).map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join('\n') || '(no args)'}` }]
+  })
+
+  trackUsage('reviewArgs', msg)
+  const text = msg.content[0].type === 'text' ? msg.content[0].text : '{}'
+  const parsed = parseHaikuJson(text, null)
+  if (!parsed) return { compliant: false, violations: ['Could not parse args review — treating as non-compliant'] }
+  return { compliant: !!parsed.compliant, violations: parsed.violations || [] }
+}
+
+// --- Legacy combined check (fallback when no args) ---
 
 const COMPLIANCE_SYSTEM = `You are a policy compliance checker for sandboxed code execution. You will be given code and a list of policy constraints.
 
@@ -245,6 +302,7 @@ ${code}
 \`\`\`` }]
   })
 
+  trackUsage('checkPolicyCompliance', msg)
   const text = msg.content[0].type === 'text' ? msg.content[0].text : '{}'
   const parsed = parseHaikuJson(text, null)
   if (!parsed) return { compliant: false, violations: ['Could not parse compliance check — treating as non-compliant'] }

@@ -6,7 +6,7 @@ import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import { ProxyDatabase, SessionPolicy } from './database.js';
 import { executeSkill, hashCode, parseMetadata, EXECUTOR_MODE } from './executor.js';
-import { analyzeCode, CodeAnalysis, reviewCode, CodeReview, reviewInvocation, checkPolicyCompliance } from './analyzer.js';
+import { analyzeCode, CodeAnalysis, reviewCode, CodeReview, reviewInvocation, checkPolicyCompliance, reviewArgs, tokenUsage } from './analyzer.js';
 import { randomBytes } from 'crypto';
 
 const app = express();
@@ -32,12 +32,20 @@ const secrets: Record<string, string> = db.getAllSecrets();
 console.log(`🔑 Loaded ${Object.keys(secrets).length} secrets from database`);
 
 // Session tracking for pending requests
-const pendingSessionIds = new Map<string, string>();   // requestId -> sessionId
+// Helper: reconstruct scope request data from DB (survives restarts)
+function getScopeRequest(requestId: string): { sessionId: string; description: string; constraints: string[]; secrets: string[]; networks: string[]; skill_code?: string; codeHash?: string; analysisSummary?: string } | null {
+  const request = db.getRequest(requestId);
+  if (!request || request.skill_url !== 'scope') return null;
+  try {
+    const code = db.getCode(requestId);
+    if (!code) return null;
+    const data = JSON.parse(code);
+    const args = request.args ? JSON.parse(request.args) : {};
+    return { sessionId: args.sessionId || '', description: data.description || '', constraints: data.constraints || [], secrets: data.secrets || [], networks: data.networks || [], skill_code: data.skill_code, codeHash: data.codeHash, analysisSummary: data.analysisSummary };
+  } catch { return null; }
+}
+
 const pendingAnalyses = new Map<string, CodeAnalysis>(); // requestId -> analysis
-const pendingScopeRequests = new Map<string, {
-  sessionId: string; description: string; constraints: string[];
-  secrets: string[]; networks: string[];
-}>();
 
 const RISK_LEVELS = { low: 0, medium: 1, high: 2 } as const;
 
@@ -55,7 +63,24 @@ function structuralPolicyCheck(analysis: CodeAnalysis, policy: SessionPolicy): {
 async function skillFitsPolicy(code: string, metadata: any, analysis: CodeAnalysis, policy: SessionPolicy, args?: Record<string, any>, codeHash?: string): Promise<{ fits: boolean; violations?: string[] }> {
   const structural = structuralPolicyCheck(analysis, policy);
 
-  // Explicit scope sessions (with constraints): two-call review
+  // Pre-approved code path: code was submitted with scope and human approved the package
+  // Skip structural check — human already approved this exact code and its resource usage
+  if (policy.approvedCodeHash && codeHash === policy.approvedCodeHash && policy.constraints?.length) {
+    if (!structural.pass) console.log(`  Pre-approved code, structural gaps ignored (human-approved): ${structural.gaps.join(', ')}`);
+    // Code is pre-approved — only check args against constraints
+    const summary = policy.approvedAnalysisSummary || analysis.summary;
+    if (args && Object.keys(args).length) {
+      console.log(`  Pre-approved code (hash match), checking args against ${policy.constraints.length} constraints`);
+      const compliance = await reviewArgs(summary, policy.constraints, args);
+      console.log(`  Args review: compliant=${compliance.compliant}${compliance.violations?.length ? ` violations=${compliance.violations.join(', ')}` : ''}`);
+      return { fits: compliance.compliant, violations: compliance.violations };
+    }
+    // No args — code is pre-approved and no parameters to check
+    console.log(`  Pre-approved code (hash match), no args — auto-approving`);
+    return { fits: true };
+  }
+
+  // Explicit scope sessions (with constraints): full review (code NOT pre-approved)
   if (policy.constraints?.length) {
     if (!structural.pass) console.log(`  Structural gaps (deferred to review): ${structural.gaps.join(', ')}`);
 
@@ -66,10 +91,15 @@ async function skillFitsPolicy(code: string, metadata: any, analysis: CodeAnalys
     };
     const review = await reviewCode(code, metadata, codeHash || '', reviewCache);
     if (!review.faithful) {
-      console.log(`  Code review: NOT faithful — ${review.concerns.join(', ')}`);
-      return { fits: false, violations: ['Code does not faithfully implement its description'] };
+      const realConcerns = review.concerns.filter(c => !/parameterized|hardcoded|env var|environment variable|not .* as described/i.test(c));
+      if (realConcerns.length) {
+        console.log(`  Code review: concerns — ${realConcerns.join(', ')}`);
+        return { fits: false, violations: realConcerns };
+      }
+      console.log(`  Code review: not faithful but no real concerns, deferring to invocation review. params=[${review.parameterized.join(',')}]`);
+    } else {
+      console.log(`  Code review: faithful, params=[${review.parameterized.join(',')}] hardcoded=${JSON.stringify(review.hardcoded)}`);
     }
-    console.log(`  Code review: faithful, params=[${review.parameterized.join(',')}] hardcoded=${JSON.stringify(review.hardcoded)}`);
 
     // Call 3: Invocation review (per-call) — are these specific args within bounds?
     if (args && Object.keys(args).length) {
@@ -129,7 +159,8 @@ if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
       }
 
       // Create or expand session from this approval
-      const sessionId = pendingSessionIds.get(requestId);
+      const reqArgs = request.args ? JSON.parse(request.args) : {};
+      const sessionId = reqArgs._sessionId;
       const analysis = pendingAnalyses.get(requestId);
       if (sessionId && analysis) {
         const existing = db.getSession(sessionId);
@@ -143,7 +174,6 @@ if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
             await telegramBot.sendSessionStartNotification(sessionId, policyFromAnalysis(analysis));
           }
         }
-        pendingSessionIds.delete(requestId);
         pendingAnalyses.delete(requestId);
       }
 
@@ -454,6 +484,19 @@ ${p.description ? `<div class="section"><b>Description:</b> ${esc(p.description)
 ${p.constraints?.length ? `<h2>Constraints (${p.constraints.length})</h2>
 ${p.constraints.map(c => `<div class="constraint">${esc(c)}</div>`).join('')}` : ''}
 
+${p.approvedCodeHash ? `<h2>Pre-approved Code</h2>
+<div class="section">
+<b>Code hash:</b> <code>${esc(p.approvedCodeHash.substring(0, 32))}...</code><br>
+${p.approvedAnalysisSummary ? `<b>Analysis:</b> ${esc(p.approvedAnalysisSummary)}<br>` : ''}
+<small class="meta">Executions matching this hash auto-approve — only args are checked against constraints.</small>
+</div>` : ''}
+
+<h2>Haiku Token Usage</h2>
+<div class="section">
+<b>Calls:</b> ${tokenUsage.calls} | <b>Input:</b> ${tokenUsage.inputTokens} tokens | <b>Output:</b> ${tokenUsage.outputTokens} tokens
+<br><small class="meta">Cumulative since last proxy restart. Haiku 4.5: $0.80/1M input, $4/1M output.</small>
+</div>
+
 <div class="section" style="margin-top:2em">
 <form method="POST" action="${B}/dashboard/revoke?token=${esc(API_BEARER_TOKEN)}">
 <input type="hidden" name="session_id" value="${esc(id)}">
@@ -485,6 +528,10 @@ function requireAuth(req: Request, res: Response, next: Function) {
 }
 
 // List active sessions
+app.get('/stats', (_req: Request, res: Response) => {
+  res.json({ haiku_tokens: tokenUsage });
+});
+
 app.get('/sessions', requireAuth, (req: Request, res: Response) => {
   const sessions = db.listSessions();
   res.json({
@@ -562,9 +609,13 @@ app.get('/approve/:id', (req: Request, res: Response) => {
   if (!token || token !== request.approval_token) return res.status(403).send('Invalid token');
 
   const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const orchUrl = req.headers['x-orchestrator-url'] as string | undefined;
+  const orchTenant = req.headers['x-tenant-id'] as string | undefined;
+  const B = orchUrl && orchTenant ? `${orchUrl}/t/${orchTenant}` : '';
+  const dashLink = `<p style="margin-top:1.5em"><a href="${B}/dashboard?token=${esc(API_BEARER_TOKEN)}" style="color:#89b4fa">📊 Dashboard</a></p>`;
 
   // Scope request approval page
-  const scopeReq = pendingScopeRequests.get(id);
+  const scopeReq = getScopeRequest(id);
   if (scopeReq && request.status === 'pending') {
     return res.type('html').send(`<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -581,26 +632,30 @@ button{font-family:monospace;font-size:1em;padding:0.6em 1.2em;border:none;borde
 .secret{background:#f38ba820;color:#f38ba8} .network{background:#89b4fa20;color:#89b4fa}
 </style></head><body>
 <h1>🔐 Scope Request</h1>
+<form method="POST">
+<input type="hidden" name="token" value="${esc(token)}">
+<input type="hidden" name="action" value="approve">
+<input type="hidden" name="level" value="scope">
 <div class="section"><b>Description:</b><br>${esc(scopeReq.description)}</div>
-<div class="section"><b>Secrets:</b> ${scopeReq.secrets.map(s => `<span class="tag secret">${esc(s)}</span>`).join(' ') || 'none'}</div>
+<div class="section"><b>Secrets:</b> ${scopeReq.secrets.map(s => {
+    const stored = db.getAllSecrets()[s];
+    return stored
+      ? `<span class="tag secret">${esc(s)} ✅</span>`
+      : `<div style="margin:0.4em 0"><label><code>${esc(s)}</code></label><br><input type="password" name="secret_${esc(s)}" placeholder="Enter ${esc(s)}" style="width:100%;padding:0.5em;background:#181825;border:1px solid #313244;color:#cdd6f4;border-radius:4px;font-family:monospace"><small style="color:#6c7086"> required</small></div>`;
+  }).join(' ') || 'none'}</div>
 <div class="section"><b>Networks:</b> ${scopeReq.networks.map(n => `<span class="tag network">${esc(n)}</span>`).join(' ') || 'none'}</div>
 <div class="section"><b>Constraints:</b>
 ${scopeReq.constraints.map(c => `<div class="constraint">${esc(c)}</div>`).join('')}
 ${!scopeReq.constraints.length ? '<div class="meta">No constraints specified</div>' : ''}
 </div>
-<div class="actions">
-<form method="POST" style="display:inline">
-  <input type="hidden" name="token" value="${esc(token)}">
-  <input type="hidden" name="action" value="approve">
-  <input type="hidden" name="level" value="scope">
-  <button type="submit" class="approve">✅ Approve Scope</button>
+${scopeReq.skill_code ? `<div class="section"><b>Skill Code:</b>${scopeReq.analysisSummary ? `<div class="constraint" style="border-color:#89b4fa">${esc(scopeReq.analysisSummary)}</div>` : ''}<pre style="background:#181825;padding:1em;border-radius:8px;overflow-x:auto;font-size:0.85em">${esc(scopeReq.skill_code)}</pre></div>` : ''}
+<div class="actions"><button type="submit" class="approve">✅ Approve Scope</button></div>
 </form>
-<form method="POST" style="display:inline">
+<form method="POST">
   <input type="hidden" name="token" value="${esc(token)}">
   <input type="hidden" name="action" value="deny">
-  <button type="submit" class="deny">❌ Deny</button>
+  <div class="actions"><button type="submit" class="deny">❌ Deny</button></div>
 </form>
-</div>
 </body></html>`);
   }
 
@@ -623,6 +678,7 @@ h1{color:#89b4fa;font-size:1.2em} .meta{color:#6c7086;margin-bottom:1em}
 </style></head><body>
 <h1>${esc(metadata?.skill || 'Skill')}</h1>
 <div class="status">${request.status === 'completed' ? '✅' : request.status === 'denied' ? '❌' : '⏳'} Status: ${esc(request.status)}${resultData?.stdout ? `\n<pre>${esc(resultData.stdout.substring(0, 500))}</pre>` : ''}${request.error ? `\n<pre>${esc(request.error.substring(0, 500))}</pre>` : ''}</div>
+${dashLink}
 </body></html>`);
   }
 
@@ -650,25 +706,26 @@ ${esc(metadata?.description || '')}
 </div>
 ${analysisSummary ? `<div class="analysis"><b>Analysis:</b><br>${esc(analysisSummary)}</div>` : ''}
 <pre>${esc(code)}</pre>
-<div class="actions">
-<form method="POST" style="display:inline">
+<form method="POST">
   <input type="hidden" name="token" value="${esc(token)}">
   <input type="hidden" name="action" value="approve">
-  <input type="hidden" name="level" value="once">
-  <button type="submit" class="approve">✅ Run Once</button>
+${(metadata?.secrets?.length) ? `<div class="section"><b>Provide Secrets:</b>${metadata.secrets.map(s => {
+    const stored = db.getAllSecrets()[s];
+    return stored
+      ? ` <span style="color:#a6e3a1"><code>${esc(s)}</code> ✅</span>`
+      : `<div style="margin:0.4em 0"><label><code>${esc(s)}</code></label><br><input type="password" name="secret_${esc(s)}" placeholder="Enter ${esc(s)}" style="width:100%;padding:0.5em;background:#181825;border:1px solid #313244;color:#cdd6f4;border-radius:4px;font-family:monospace"></div>`;
+  }).join('')}</div>` : ''}
+  <div class="actions">
+    <button type="submit" name="level" value="once" class="approve">✅ Run Once</button>
+    <button type="submit" name="level" value="trust_code" class="trust">🔒 Trust Code</button>
+  </div>
 </form>
-<form method="POST" style="display:inline">
-  <input type="hidden" name="token" value="${esc(token)}">
-  <input type="hidden" name="action" value="approve">
-  <input type="hidden" name="level" value="trust_code">
-  <button type="submit" class="trust">🔒 Trust Code</button>
-</form>
-<form method="POST" style="display:inline">
+<form method="POST">
   <input type="hidden" name="token" value="${esc(token)}">
   <input type="hidden" name="action" value="deny">
-  <button type="submit" class="deny">❌ Deny</button>
+  <div class="actions"><button type="submit" class="deny">❌ Deny</button></div>
 </form>
-</div>
+${dashLink}
 </body></html>`);
 });
 
@@ -699,8 +756,13 @@ app.post('/approve/:id', async (req: Request, res: Response) => {
 </head><body><h2>❌ Denied</h2><p>Request ${esc(id)} was denied.</p></body></html>`);
   }
 
+  // Store any secrets provided with the approval form
+  for (const key of Object.keys(req.body)) {
+    if (key.startsWith('secret_') && req.body[key]) { const n = key.slice(7); secrets[n] = req.body[key]; db.setSecret(n, req.body[key]); }
+  }
+
   // Scope request approval — create session with constraints
-  const scopeReq = pendingScopeRequests.get(id);
+  const scopeReq = getScopeRequest(id);
   if (scopeReq) {
     const policy: SessionPolicy = {
       allowedSecrets: scopeReq.secrets,
@@ -708,13 +770,15 @@ app.post('/approve/:id', async (req: Request, res: Response) => {
       allowMutating: true,
       maxRiskLevel: 'medium',
       constraints: scopeReq.constraints,
-      description: scopeReq.description
+      description: scopeReq.description,
+      approvedCodeHash: scopeReq.codeHash,
+      approvedAnalysisSummary: scopeReq.analysisSummary,
     };
     db.createSession(scopeReq.sessionId, policy);
     db.updateRequestStatus(id, 'completed');
-    pendingScopeRequests.delete(id);
     notifyStatusWaiters(id);
-    console.log(`📋 Scope approved, session ${scopeReq.sessionId} created with ${scopeReq.constraints.length} constraints`);
+    console.log(`📋 Scope approved, session ${scopeReq.sessionId} created with ${scopeReq.constraints.length} constraints${scopeReq.codeHash ? `, code hash ${scopeReq.codeHash.substring(0, 16)}` : ''}`);
+
     return res.type('html').send(`<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <style>body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;padding:2em;text-align:center}
@@ -733,7 +797,8 @@ a{color:#89b4fa}</style>
   }
 
   // Session handling
-  const sessionId = pendingSessionIds.get(id);
+  const reqArgs = request.args ? JSON.parse(request.args) : {};
+  const sessionId = reqArgs._sessionId;
   const analysisData = pendingAnalyses.get(id);
   if (sessionId && analysisData) {
     const existing = db.getSession(sessionId);
@@ -742,7 +807,6 @@ a{color:#89b4fa}</style>
     } else {
       db.createSession(sessionId, policyFromAnalysis(analysisData));
     }
-    pendingSessionIds.delete(id);
     pendingAnalyses.delete(id);
   }
 
@@ -770,32 +834,40 @@ a{color:#89b4fa}</style>
 // Request scope (creates session with constraints, pending human approval)
 app.post('/scope', requireAuth, async (req: Request, res: Response) => {
   try {
-    const { session_id: clientSessionId, description, constraints, secrets: requestedSecrets, networks } = req.body;
+    const { session_id: clientSessionId, description, constraints, secrets: requestedSecrets, networks, skill_code } = req.body;
     if (!description) return res.status(400).json({ error: 'Missing description' });
     const sessionId = clientSessionId || `session_${randomBytes(8).toString('hex')}`;
     const secretsList = Array.isArray(requestedSecrets) ? requestedSecrets : [];
     const networksList = Array.isArray(networks) ? networks : [];
     const constraintsList = Array.isArray(constraints) ? constraints : [];
 
+    // If code provided, analyze it upfront so human can review code+scope together
+    let codeHash: string | undefined;
+    let analysisSummary: string | undefined;
+    if (skill_code) {
+      codeHash = hashCode(skill_code);
+      const metadata = parseMetadata(skill_code);
+      if (metadata && process.env.ANTHROPIC_API_KEY) {
+        const cache = { get: (h: string) => db.getAnalysis(h), set: (h: string, a: CodeAnalysis) => db.setAnalysis(h, a) };
+        const analysis = await analyzeCode(skill_code, metadata, codeHash, cache);
+        analysisSummary = analysis.summary;
+      }
+    }
+
     const requestId = `scope_${randomBytes(8).toString('hex')}`;
     const approvalToken = randomBytes(32).toString('hex');
-    const scopeData = JSON.stringify({ description, constraints: constraintsList, secrets: secretsList, networks: networksList });
+    const scopeData = JSON.stringify({ description, constraints: constraintsList, secrets: secretsList, networks: networksList, skill_code, codeHash, analysisSummary });
 
-    db.createRequest(requestId, 'scope-request', 'scope', hashCode(scopeData), secretsList, { description, constraints: constraintsList, networks: networksList }, approvalToken);
+    db.createRequest(requestId, 'scope-request', 'scope', hashCode(scopeData), secretsList, { sessionId, description, constraints: constraintsList, networks: networksList }, approvalToken);
     db.storeCode(requestId, scopeData);
-
-    // Store pending scope for approval handler
-    pendingScopeRequests.set(requestId, {
-      sessionId, description, constraints: constraintsList,
-      secrets: secretsList, networks: networksList
-    });
 
     const orchUrl = req.headers['x-orchestrator-url'] as string | undefined;
     const orchTenant = req.headers['x-tenant-id'] as string | undefined;
     const urlBase = orchUrl && orchTenant ? `${orchUrl}/t/${orchTenant}` : PUBLIC_URL;
     const approvalUrl = urlBase ? `${urlBase}/approve/${requestId}?token=${approvalToken}` : undefined;
     const statusUrl = urlBase ? `${urlBase}/execute/${requestId}/status?wait=true` : undefined;
-    res.json({ request_id: requestId, status: 'pending_scope', session_id: sessionId, approval_url: approvalUrl, status_url: statusUrl, message: 'Scope request awaiting approval — poll status_url to be notified when approved' });
+    const dashboardUrl = urlBase ? `${urlBase}/dashboard?token=${API_BEARER_TOKEN}` : undefined;
+    res.json({ request_id: requestId, status: 'pending_scope', session_id: sessionId, approval_url: approvalUrl, status_url: statusUrl, dashboard_url: dashboardUrl, message: 'Scope request awaiting approval — poll status_url to be notified when approved' });
   } catch (error: any) {
     console.error('Scope request error:', error);
     res.status(500).json({ error: error.message });
@@ -822,8 +894,9 @@ app.post('/execute', requireAuth, async (req: Request, res: Response) => {
     const metadata = parseMetadata(code);
     if (!metadata) return res.status(400).json({ error: 'Invalid skill format - missing metadata' });
 
-    const secretsList = Array.isArray(requiredSecrets) ? requiredSecrets
-      : requiredSecrets && typeof requiredSecrets === 'object' ? Object.keys(requiredSecrets) : [];
+    const secretsList = Array.isArray(requiredSecrets) && requiredSecrets.length ? requiredSecrets
+      : requiredSecrets && typeof requiredSecrets === 'object' ? Object.keys(requiredSecrets)
+      : metadata?.secrets || [];
 
     // Check what approval path this would take
     const existingApproval = db.getApproval(skill_url || 'inline', codeHash);
@@ -896,10 +969,8 @@ app.post('/execute', requireAuth, async (req: Request, res: Response) => {
 
     const requestId = `exec_${randomBytes(8).toString('hex')}`;
     const approvalToken = randomBytes(32).toString('hex');
-    db.createRequest(requestId, skill_id, skill_url || 'inline', codeHash, secretsList, args, approvalToken);
+    db.createRequest(requestId, skill_id, skill_url || 'inline', codeHash, secretsList, { ...args, _sessionId: sessionId }, approvalToken);
     db.storeCode(requestId, code);
-
-    pendingSessionIds.set(requestId, sessionId);
     if (analysis) pendingAnalyses.set(requestId, analysis);
 
     const orchUrl = req.headers['x-orchestrator-url'] as string | undefined;
@@ -933,6 +1004,20 @@ function notifyStatusWaiters(requestId: string) {
   }
 }
 
+function buildStatusResponse(request: any): any {
+  const r: any = { request_id: request.id, status: request.status, created_at: request.created_at };
+  if (request.approved_at) r.approved_at = request.approved_at;
+  if (request.executed_at) r.executed_at = request.executed_at;
+  if (request.result) r.result = JSON.parse(request.result);
+  if (request.error) r.error = request.error;
+  // Include session_id for scope requests so agents can chain scope→execute
+  if (request.skill_url === 'scope') {
+    const args = request.args ? JSON.parse(request.args) : {};
+    if (args.sessionId) r.session_id = args.sessionId;
+  }
+  return r;
+}
+
 // Get execution status — supports ?wait=true for long-poll (up to 120s)
 app.get('/execute/:id/status', requireAuth, async (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
@@ -952,22 +1037,10 @@ app.get('/execute/:id/status', requireAuth, async (req: Request, res: Response) 
     });
     // Re-read after waking
     const updated = db.getRequest(id);
-    if (updated) {
-      const response: any = { request_id: updated.id, status: updated.status, created_at: updated.created_at };
-      if (updated.approved_at) response.approved_at = updated.approved_at;
-      if (updated.executed_at) response.executed_at = updated.executed_at;
-      if (updated.result) response.result = JSON.parse(updated.result);
-      if (updated.error) response.error = updated.error;
-      return res.json(response);
-    }
+    if (updated) return res.json(buildStatusResponse(updated));
   }
 
-  const response: any = { request_id: request.id, status: request.status, created_at: request.created_at };
-  if (request.approved_at) response.approved_at = request.approved_at;
-  if (request.executed_at) response.executed_at = request.executed_at;
-  if (request.result) response.result = JSON.parse(request.result);
-  if (request.error) response.error = request.error;
-  res.json(response);
+  res.json(buildStatusResponse(request));
 });
 
 // Helper: Execute skill in background

@@ -341,4 +341,6 @@ export interface SessionPolicy {
   maxRiskLevel: 'low' | 'medium' | 'high';
   constraints?: string[];
   description?: string;
+  approvedCodeHash?: string;
+  approvedAnalysisSummary?: string;
 }
