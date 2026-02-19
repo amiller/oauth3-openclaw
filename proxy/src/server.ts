@@ -337,6 +337,9 @@ app.get('/dashboard', (req: Request, res: Response) => {
   const sessions = db.listSessions();
   const requests = db.listRecentRequests(30);
   const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const orchUrl = req.headers['x-orchestrator-url'] as string | undefined;
+  const orchTenant = req.headers['x-tenant-id'] as string | undefined;
+  const B = orchUrl && orchTenant ? `${orchUrl}/t/${orchTenant}` : '';
   const ago = (ts: number) => {
     const m = Math.round((Date.now() - ts) / 60000);
     return m < 60 ? `${m}m ago` : `${Math.round(m / 60)}h ago`;
@@ -367,13 +370,13 @@ a{color:#89b4fa;text-decoration:none} a:hover{text-decoration:underline}
 ${sessions.length === 0 ? '<p class="empty">No active sessions</p>' : `<table>
 <tr><th>Session</th><th>Age</th><th>Idle</th><th>Secrets</th><th>Networks</th><th>Risk</th><th></th></tr>
 ${sessions.map(s => `<tr>
-<td><a href="/dashboard/session/${esc(s.session_id)}?token=${esc(API_BEARER_TOKEN)}"><code>${esc(s.session_id.substring(0, 20))}</code></a>${s.policy.description ? `<br><small>${esc(s.policy.description.substring(0, 60))}</small>` : ''}</td>
+<td><a href="${B}/dashboard/session/${esc(s.session_id)}?token=${esc(API_BEARER_TOKEN)}"><code>${esc(s.session_id.substring(0, 20))}</code></a>${s.policy.description ? `<br><small>${esc(s.policy.description.substring(0, 60))}</small>` : ''}</td>
 <td>${ago(s.created_at)}</td>
 <td>${ago(s.last_activity)}</td>
 <td>${s.policy.allowedSecrets.map((x: string) => `<span class="tag secret">${esc(x)}</span>`).join(' ') || '—'}</td>
 <td>${s.policy.allowedNetworks.map((x: string) => `<span class="tag network">${esc(x)}</span>`).join(' ') || '—'}</td>
 <td class="risk-${s.policy.maxRiskLevel}">${s.policy.maxRiskLevel}${s.policy.constraints?.length ? `<br><small>${s.policy.constraints.length} constraints</small>` : ''}</td>
-<td><form method="POST" action="/dashboard/revoke?token=${esc(API_BEARER_TOKEN)}" style="display:inline">
+<td><form method="POST" action="${B}/dashboard/revoke?token=${esc(API_BEARER_TOKEN)}" style="display:inline">
 <input type="hidden" name="session_id" value="${esc(s.session_id)}">
 <button class="btn" type="submit">revoke</button></form></td>
 </tr>`).join('')}
@@ -387,11 +390,11 @@ ${requests.map(r => `<tr>
 <td>${esc(r.skill_id)}</td>
 <td>${statusIcon[r.status] || '?'} ${esc(r.status)}</td>
 <td>${ago(r.created_at)}</td>
-<td>${r.code_hash ? `<a href="/view/${esc(r.id)}?token=${esc(API_BEARER_TOKEN)}">code</a>` : ''}</td>
+<td>${r.code_hash ? `<a href="${B}/view/${esc(r.id)}?token=${esc(API_BEARER_TOKEN)}">code</a>` : ''}</td>
 </tr>`).join('')}
 </table>`}
 
-<p style="color:#6c7086;margin-top:2em;font-size:0.8em">Sessions expire after 2h of inactivity. <a href="/dashboard?token=${esc(API_BEARER_TOKEN)}">Refresh</a></p>
+<p style="color:#6c7086;margin-top:2em;font-size:0.8em">Sessions expire after 2h of inactivity. <a href="${B}/dashboard?token=${esc(API_BEARER_TOKEN)}">Refresh</a></p>
 </body></html>`);
 });
 
@@ -400,6 +403,9 @@ app.post('/dashboard/revoke', (req: Request, res: Response) => {
   if (API_BEARER_TOKEN && req.query.token !== API_BEARER_TOKEN) return res.status(401).send('Unauthorized');
   const { session_id } = req.body;
   if (session_id) db.deleteSession(session_id);
+  const orchUrl = req.headers['x-orchestrator-url'] as string | undefined;
+  const orchTenant = req.headers['x-tenant-id'] as string | undefined;
+  const B = orchUrl && orchTenant ? `${orchUrl}/t/${orchTenant}` : '';
   res.redirect(`/dashboard?token=${API_BEARER_TOKEN}`);
 });
 
@@ -410,6 +416,9 @@ app.get('/dashboard/session/:id', (req: Request, res: Response) => {
   const session = db.getSession(id);
   if (!session) return res.status(404).send('Session not found or expired');
   const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const orchUrl = req.headers['x-orchestrator-url'] as string | undefined;
+  const orchTenant = req.headers['x-tenant-id'] as string | undefined;
+  const B = orchUrl && orchTenant ? `${orchUrl}/t/${orchTenant}` : '';
   const p = session.policy;
 
   res.type('html').send(`<!DOCTYPE html>
@@ -426,7 +435,7 @@ a{color:#89b4fa;text-decoration:none} a:hover{text-decoration:underline}
 .risk-low{color:#a6e3a1} .risk-medium{color:#f9e2af} .risk-high{color:#f38ba8}
 .btn{font-family:monospace;font-size:0.85em;padding:0.4em 0.8em;border:1px solid #f38ba8;color:#f38ba8;background:none;border-radius:4px;cursor:pointer}
 </style></head><body>
-<p><a href="/dashboard?token=${esc(API_BEARER_TOKEN)}">&larr; Dashboard</a></p>
+<p><a href="${B}/dashboard?token=${esc(API_BEARER_TOKEN)}">&larr; Dashboard</a></p>
 <h1>Session</h1>
 <div class="meta"><code>${esc(id)}</code></div>
 ${p.description ? `<div class="section"><b>Description:</b> ${esc(p.description)}</div>` : ''}
@@ -446,7 +455,7 @@ ${p.constraints?.length ? `<h2>Constraints (${p.constraints.length})</h2>
 ${p.constraints.map(c => `<div class="constraint">${esc(c)}</div>`).join('')}` : ''}
 
 <div class="section" style="margin-top:2em">
-<form method="POST" action="/dashboard/revoke?token=${esc(API_BEARER_TOKEN)}">
+<form method="POST" action="${B}/dashboard/revoke?token=${esc(API_BEARER_TOKEN)}">
 <input type="hidden" name="session_id" value="${esc(id)}">
 <button class="btn" type="submit">Revoke Session</button>
 </form></div>
@@ -670,9 +679,12 @@ app.post('/approve/:id', async (req: Request, res: Response) => {
   const request = db.getRequest(id);
   if (!request) return res.status(404).send('Not found');
   if (!token || token !== request.approval_token) return res.status(403).send('Invalid token');
-  if (request.status !== 'pending') return res.redirect(`/approve/${id}?token=${token}`);
-
   const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const orchUrl = req.headers['x-orchestrator-url'] as string | undefined;
+  const orchTenant = req.headers['x-tenant-id'] as string | undefined;
+  const B = orchUrl && orchTenant ? `${orchUrl}/t/${orchTenant}` : '';
+  const dashboardUrl = `${B}/dashboard?token=${esc(API_BEARER_TOKEN)}`;
+  if (request.status !== 'pending') return res.redirect(`/approve/${id}?token=${token}`);
 
   if (action === 'deny') {
     db.updateRequestStatus(id, 'denied');
@@ -710,7 +722,7 @@ a{color:#89b4fa}</style>
 </head><body><h2>✅ Scope Approved</h2>
 <p>Session <code>${esc(scopeReq.sessionId)}</code> created.</p>
 <p>${scopeReq.constraints.length} constraints active.</p>
-<p><a href="/dashboard?token=${esc(API_BEARER_TOKEN)}">View Dashboard</a></p>
+<p><a href="${dashboardUrl}">View Dashboard</a></p>
 </body></html>`);
   }
 
