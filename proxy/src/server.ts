@@ -751,7 +751,7 @@ app.post('/execute', requireTenant, syncTenant, async (req: Request, res: Respon
     // Check session policy (structured constraints don't need analysis)
     let policyViolations: string[] | undefined;
     const session = db.getSession(sessionId);
-    if (session && (analysis || session.policy.structuredConstraints?.length)) {
+    if (session) {
       const sc = session.policy.structuredConstraints?.length || 0;
       console.log(`📋 Checking session ${sessionId}: secrets=${JSON.stringify(session.policy.allowedSecrets)} networks=${JSON.stringify(session.policy.allowedNetworks)} constraints=${session.policy.constraints?.length || 0} structured=${sc}`);
       if (analysis) console.log(`   Analysis: secrets=${JSON.stringify(analysis.secretsUsed)} networks=${JSON.stringify(analysis.networkTargets)} risk=${analysis.riskLevel}`);

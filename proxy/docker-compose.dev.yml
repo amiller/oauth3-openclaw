@@ -19,6 +19,8 @@ services:
       CORS_ORIGIN: "*"
       PORT: 3000
       DB_PATH: /data/proxy.db
+      JWT_SECRET: dev-secret-change-in-production
+      PUBLIC_URL: http://localhost:3000
     volumes:
       - proxydata:/data
     depends_on:
