@@ -1,4 +1,4 @@
-import { createHmac } from 'crypto'
+import { createHmac, randomBytes } from 'crypto'
 import { Request, Response, NextFunction } from 'express'
 
 const JWT_SECRET = process.env.JWT_SECRET || ''
@@ -53,7 +53,7 @@ function getSecret(): string {
   if (JWT_SECRET) return JWT_SECRET
   // Standalone mode: use a per-process secret (or derive from dstack later)
   if (!standaloneSecret) {
-    standaloneSecret = require('crypto').randomBytes(32).toString('hex')
+    standaloneSecret = randomBytes(32).toString('hex')
     console.log('🔑 Standalone mode: generated local JWT secret')
   }
   return standaloneSecret
@@ -98,7 +98,7 @@ export function requireTenant(req: Request, res: Response, next: NextFunction) {
 export function handleSignup(req: Request, res: Response) {
   if (!STANDALONE) return res.status(404).json({ error: 'Signup not available — use orchestrator' })
   const { name } = req.body || {}
-  const tenantId = `tenant_${require('crypto').randomBytes(8).toString('hex')}`
+  const tenantId = `tenant_${randomBytes(8).toString('hex')}`
   const token = issueToken(tenantId)
   res.json({ tenant_id: tenantId, token, message: 'Store this token — it cannot be recovered' })
 }

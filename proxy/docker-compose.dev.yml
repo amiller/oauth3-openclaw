@@ -16,10 +16,14 @@ services:
       - "3000:3000"
     environment:
       DATABASE_URL: postgres://oauth3:dev@postgres:5432/oauth3
-      CORS_ORIGIN: http://localhost:5173
+      CORS_ORIGIN: "*"
       PORT: 3000
+      DB_PATH: /data/proxy.db
+    volumes:
+      - proxydata:/data
     depends_on:
       - postgres
 
 volumes:
   pgdata:
+  proxydata:
