@@ -15,6 +15,12 @@ import { join } from 'path';
 
 const execFileAsync = promisify(execFile);
 
+/** Prepend `const args = {...}` so skill code can use `args.key` directly */
+function injectArgsPreamble(code: string, args?: Record<string, any>): string {
+  const obj = args && Object.keys(args).length ? JSON.stringify(args) : '{}'
+  return `const args: Record<string, any> = ${obj};\n${code}`
+}
+
 export const EXECUTOR_MODE = process.env.EXECUTOR_MODE || 'docker';
 
 export interface SkillMetadata {
@@ -136,7 +142,7 @@ async function executeSkillDirect(request: ExecutionRequest): Promise<ExecutionR
   const startTime = Date.now();
   const codeHash = hashCode(request.code);
   const tmpFile = join(tmpdir(), `skill-${codeHash}.ts`);
-  await writeFile(tmpFile, request.code, 'utf8');
+  await writeFile(tmpFile, injectArgsPreamble(request.code, request.args), 'utf8');
 
   try {
     const timeout = request.timeout || 30;
@@ -180,7 +186,7 @@ async function executeSkillDocker(request: ExecutionRequest): Promise<ExecutionR
   const startTime = Date.now();
   const codeHash = hashCode(request.code);
   const tmpFile = join(tmpdir(), `skill-${codeHash}.ts`);
-  await writeFile(tmpFile, request.code, 'utf8');
+  await writeFile(tmpFile, injectArgsPreamble(request.code, request.args), 'utf8');
 
   try {
     const timeout = request.timeout || 30;

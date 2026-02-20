@@ -1,6 +1,6 @@
 {
   "name": "execution-proxy",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "Execution proxy with Telegram approval",
   "type": "module",
   "main": "dist/server.js",
