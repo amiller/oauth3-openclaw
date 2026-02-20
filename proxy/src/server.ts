@@ -8,6 +8,7 @@ import { ProxyDatabase, SessionPolicy } from './database.js';
 import { executeSkill, hashCode, parseMetadata, EXECUTOR_MODE } from './executor.js';
 import { analyzeCode, CodeAnalysis, reviewCode, CodeReview, reviewInvocation, checkPolicyCompliance, reviewArgs, tokenUsage } from './analyzer.js';
 import { PolicyConstraint, enforceStrict, enforceSoft, isStructuredConstraint, splitConstraints } from './policy.js';
+import { requireTenant, handleSignup, TenantContext } from './auth.js';
 import { randomBytes } from 'crypto';
 
 const app = express();
@@ -413,6 +414,12 @@ Executor: ${EXECUTOR_MODE} mode
 `);
 });
 
+// Health check
+app.get('/health', (_req: Request, res: Response) => res.json({ status: 'ok', executor: EXECUTOR_MODE }));
+
+// Standalone signup (only available when no JWT_SECRET configured)
+app.post('/signup', handleSignup);
+
 // Dashboard — human-facing session/execution browser
 app.get('/dashboard', (req: Request, res: Response) => {
   if (API_BEARER_TOKEN && req.query.token !== API_BEARER_TOKEN) return res.status(401).send('Unauthorized — append ?token=...');
@@ -558,7 +565,7 @@ ${p.approvedAnalysisSummary ? `<b>Analysis:</b> ${esc(p.approvedAnalysisSummary)
 });
 
 // Add secret — persists to SQLite
-app.post('/secrets', requireAuth, (req: Request, res: Response) => {
+app.post('/secrets', requireTenant, (req: Request, res: Response) => {
   const { name, value } = req.body;
   if (!name || !value) return res.status(400).json({ error: 'Missing name or value' });
   secrets[name] = value;
@@ -567,24 +574,19 @@ app.post('/secrets', requireAuth, (req: Request, res: Response) => {
 });
 
 // List secrets (names only)
-app.get('/secrets', requireAuth, (req: Request, res: Response) => {
+app.get('/secrets', requireTenant, (req: Request, res: Response) => {
   res.json({ secrets: Object.keys(secrets) });
 });
 
-// Bearer token auth for internal endpoints
-function requireAuth(req: Request, res: Response, next: Function) {
-  if (!API_BEARER_TOKEN) return next(); // no token configured = open access (dev mode)
-  const auth = req.headers.authorization;
-  if (auth === `Bearer ${API_BEARER_TOKEN}`) return next();
-  res.status(401).json({ error: 'Unauthorized' });
-}
+// Auth: JWT (from orchestrator or standalone) with legacy bearer token fallback
+// Imported from ./auth.ts as requireTenant middleware
 
 // List active sessions
 app.get('/stats', (_req: Request, res: Response) => {
   res.json({ haiku_tokens: tokenUsage });
 });
 
-app.get('/sessions', requireAuth, (req: Request, res: Response) => {
+app.get('/sessions', requireTenant, (req: Request, res: Response) => {
   const sessions = db.listSessions();
   res.json({
     sessions: sessions.map(s => ({
@@ -599,7 +601,7 @@ app.get('/sessions', requireAuth, (req: Request, res: Response) => {
 });
 
 // Get single session
-app.get('/sessions/:id', requireAuth, (req: Request, res: Response) => {
+app.get('/sessions/:id', requireTenant, (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const session = db.getSession(id);
   if (!session) return res.status(404).json({ error: 'Session not found or expired' });
@@ -614,7 +616,7 @@ app.get('/sessions/:id', requireAuth, (req: Request, res: Response) => {
 });
 
 // Revoke session
-app.delete('/sessions/:id', requireAuth, (req: Request, res: Response) => {
+app.delete('/sessions/:id', requireTenant, (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const session = db.getSession(id);
   if (!session) return res.status(404).json({ error: 'Session not found or expired' });
@@ -623,9 +625,9 @@ app.delete('/sessions/:id', requireAuth, (req: Request, res: Response) => {
 });
 
 // View code for an execution request (accepts bearer header or ?token= query param)
-app.get('/view/:id', (req: Request, res: Response, next: Function) => {
+app.get('/view/:id', (req: Request, res: Response, next: () => void) => {
   if (API_BEARER_TOKEN && req.query.token === API_BEARER_TOKEN) return next();
-  requireAuth(req, res, next);
+  requireTenant(req, res, next);
 }, (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const code = db.getCode(id);
@@ -940,7 +942,7 @@ a{color:#89b4fa}</style>
 });
 
 // Request scope (creates session with constraints, pending human approval)
-app.post('/scope', requireAuth, async (req: Request, res: Response) => {
+app.post('/scope', requireTenant, async (req: Request, res: Response) => {
   try {
     const { session_id: clientSessionId, description, constraints, secrets: requestedSecrets, networks, skill_code } = req.body;
     if (!description) return res.status(400).json({ error: 'Missing description' });
@@ -983,7 +985,7 @@ app.post('/scope', requireAuth, async (req: Request, res: Response) => {
 });
 
 // Request execution (supports dry_run: true to check without executing)
-app.post('/execute', requireAuth, async (req: Request, res: Response) => {
+app.post('/execute', requireTenant, async (req: Request, res: Response) => {
   try {
     const { skill_id, skill_url, skill_code, secrets: requiredSecrets, args, session_id: clientSessionId, dry_run } = req.body;
     if (!skill_id) return res.status(400).json({ error: 'Missing skill_id' });
@@ -1130,7 +1132,7 @@ function buildStatusResponse(request: any): any {
 }
 
 // Get execution status — supports ?wait=true for long-poll (up to 120s)
-app.get('/execute/:id/status', requireAuth, async (req: Request, res: Response) => {
+app.get('/execute/:id/status', requireTenant, async (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const request = db.getRequest(id);
   if (!request) return res.status(404).json({ error: 'Request not found' });
