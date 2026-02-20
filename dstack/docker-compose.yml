@@ -1,0 +1,51 @@
+# OAuth3 Enclave — dstack CVM deployment with attested TLS via Cloudflare
+# Deploy: dstack compose up -d
+# Requires .env with CLOUDFLARE_API_TOKEN
+
+services:
+  dstack-ingress:
+    image: kvin/dstack-ingress@sha256:0f4b1fdd7e077c4a25d3bb3a0837e04d0a18f45e2018af0be1124bceee167880
+    ports:
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+      DNS_PROVIDER: cloudflare
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
+      GATEWAY_DOMAIN: ${GATEWAY_DOMAIN:-_.dstack-pha-prod9.phala.network}
+      CERTBOT_EMAIL: ${CERTBOT_EMAIL:-amiller@oauth3.net}
+      SET_CAA: "true"
+      TARGET_ENDPOINT: http://oauth3-proxy:3737
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - cert-data:/etc/letsencrypt
+    restart: unless-stopped
+
+  oauth3-proxy:
+    build: ../proxy
+    environment:
+      PORT: "3737"
+      DB_PATH: /data/proxy.db
+      EXECUTOR_MODE: direct
+      DATABASE_URL: postgres://${PG_USER:-oauth3}:${PG_PASSWORD}@postgres:5432/${PG_DB:-oauth3}
+      CORS_ORIGIN: ${CORS_ORIGIN}
+      JWT_SECRET: ${JWT_SECRET:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    volumes:
+      - oauth3-data:/data
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${PG_DB:-oauth3}
+      POSTGRES_USER: ${PG_USER:-oauth3}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  cert-data:
+  oauth3-data:
+  pgdata:
