@@ -18,13 +18,15 @@
     "better-sqlite3": "^12.6.2",
     "dotenv": "^17.2.4",
     "express": "^5.2.1",
-    "node-telegram-bot-api": "^0.67.0"
+    "node-telegram-bot-api": "^0.67.0",
+    "pg": "^8.13.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/express": "^5.0.6",
     "@types/node": "^25.2.2",
     "@types/node-telegram-bot-api": "^0.64.13",
+    "@types/pg": "^8.11.0",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3"
   }

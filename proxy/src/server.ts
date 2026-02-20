@@ -9,12 +9,23 @@ import { executeSkill, hashCode, parseMetadata, EXECUTOR_MODE } from './executor
 import { analyzeCode, CodeAnalysis, reviewCode, CodeReview, reviewInvocation, checkPolicyCompliance, reviewArgs, tokenUsage } from './analyzer.js';
 import { PolicyConstraint, enforceStrict, enforceSoft, isStructuredConstraint, splitConstraints } from './policy.js';
 import { requireTenant, handleSignup, TenantContext } from './auth.js';
+import * as pgLog from './postgres.js';
 import { randomBytes } from 'crypto';
 
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use((_req, res, next) => { res.setHeader('Referrer-Policy', 'no-referrer'); next(); });
+
+// Sync tenant context to db + Postgres after auth
+function syncTenant(req: Request, _res: Response, next: () => void) {
+  const tenant = (req as any).tenant as TenantContext | undefined;
+  if (tenant) {
+    db.tenantId = tenant.tenant_id;
+    pgLog.ensureTenant(tenant.tenant_id, tenant.plan);
+  }
+  next();
+}
 
 // Config from environment
 const PORT = parseInt(process.env.PORT || '3737');
@@ -565,7 +576,7 @@ ${p.approvedAnalysisSummary ? `<b>Analysis:</b> ${esc(p.approvedAnalysisSummary)
 });
 
 // Add secret — persists to SQLite
-app.post('/secrets', requireTenant, (req: Request, res: Response) => {
+app.post('/secrets', requireTenant, syncTenant, (req: Request, res: Response) => {
   const { name, value } = req.body;
   if (!name || !value) return res.status(400).json({ error: 'Missing name or value' });
   secrets[name] = value;
@@ -574,7 +585,7 @@ app.post('/secrets', requireTenant, (req: Request, res: Response) => {
 });
 
 // List secrets (names only)
-app.get('/secrets', requireTenant, (req: Request, res: Response) => {
+app.get('/secrets', requireTenant, syncTenant, (req: Request, res: Response) => {
   res.json({ secrets: Object.keys(secrets) });
 });
 
@@ -586,7 +597,7 @@ app.get('/stats', (_req: Request, res: Response) => {
   res.json({ haiku_tokens: tokenUsage });
 });
 
-app.get('/sessions', requireTenant, (req: Request, res: Response) => {
+app.get('/sessions', requireTenant, syncTenant, (req: Request, res: Response) => {
   const sessions = db.listSessions();
   res.json({
     sessions: sessions.map(s => ({
@@ -601,7 +612,7 @@ app.get('/sessions', requireTenant, (req: Request, res: Response) => {
 });
 
 // Get single session
-app.get('/sessions/:id', requireTenant, (req: Request, res: Response) => {
+app.get('/sessions/:id', requireTenant, syncTenant, (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const session = db.getSession(id);
   if (!session) return res.status(404).json({ error: 'Session not found or expired' });
@@ -616,7 +627,7 @@ app.get('/sessions/:id', requireTenant, (req: Request, res: Response) => {
 });
 
 // Revoke session
-app.delete('/sessions/:id', requireTenant, (req: Request, res: Response) => {
+app.delete('/sessions/:id', requireTenant, syncTenant, (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const session = db.getSession(id);
   if (!session) return res.status(404).json({ error: 'Session not found or expired' });
@@ -942,7 +953,7 @@ a{color:#89b4fa}</style>
 });
 
 // Request scope (creates session with constraints, pending human approval)
-app.post('/scope', requireTenant, async (req: Request, res: Response) => {
+app.post('/scope', requireTenant, syncTenant, async (req: Request, res: Response) => {
   try {
     const { session_id: clientSessionId, description, constraints, secrets: requestedSecrets, networks, skill_code } = req.body;
     if (!description) return res.status(400).json({ error: 'Missing description' });
@@ -985,7 +996,7 @@ app.post('/scope', requireTenant, async (req: Request, res: Response) => {
 });
 
 // Request execution (supports dry_run: true to check without executing)
-app.post('/execute', requireTenant, async (req: Request, res: Response) => {
+app.post('/execute', requireTenant, syncTenant, async (req: Request, res: Response) => {
   try {
     const { skill_id, skill_url, skill_code, secrets: requiredSecrets, args, session_id: clientSessionId, dry_run } = req.body;
     if (!skill_id) return res.status(400).json({ error: 'Missing skill_id' });
@@ -1132,7 +1143,7 @@ function buildStatusResponse(request: any): any {
 }
 
 // Get execution status — supports ?wait=true for long-poll (up to 120s)
-app.get('/execute/:id/status', requireTenant, async (req: Request, res: Response) => {
+app.get('/execute/:id/status', requireTenant, syncTenant, async (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const request = db.getRequest(id);
   if (!request) return res.status(404).json({ error: 'Request not found' });
