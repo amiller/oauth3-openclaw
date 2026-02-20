@@ -93,9 +93,21 @@ export class ProxyDatabase {
         policy TEXT NOT NULL DEFAULT '{}'
       );
 
+      CREATE TABLE IF NOT EXISTS scope_grants (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        description TEXT,
+        constraints TEXT,
+        secrets TEXT,
+        networks TEXT,
+        approved_at INTEGER,
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+      );
+
       CREATE INDEX IF NOT EXISTS idx_requests_status ON execution_requests(status);
       CREATE INDEX IF NOT EXISTS idx_requests_created ON execution_requests(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_approvals_expires ON skill_approvals(expires_at);
+      CREATE INDEX IF NOT EXISTS idx_scope_grants_session ON scope_grants(session_id);
     `);
     // Migrations
     try { this.db.exec('ALTER TABLE execution_requests ADD COLUMN code TEXT'); } catch {}
@@ -325,6 +337,26 @@ export class ProxyDatabase {
     return rows.map(r => ({ ...r, policy: JSON.parse(r.policy) }));
   }
 
+  // Scope Grants
+
+  addScopeGrant(sessionId: string, description: string | undefined, constraints: PolicyConstraint[], scopeSecrets: string[], networks: string[]): void {
+    this.db.prepare(
+      'INSERT INTO scope_grants (session_id, description, constraints, secrets, networks, approved_at) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(sessionId, description || null, JSON.stringify(constraints), JSON.stringify(scopeSecrets), JSON.stringify(networks), Date.now());
+  }
+
+  getScopeGrants(sessionId: string): Array<{ id: number; description: string | null; constraints: PolicyConstraint[]; secrets: string[]; networks: string[]; approved_at: number }> {
+    const rows = this.db.prepare('SELECT * FROM scope_grants WHERE session_id = ? ORDER BY approved_at').all(sessionId) as any[];
+    return rows.map(r => ({
+      id: r.id,
+      description: r.description,
+      constraints: JSON.parse(r.constraints || '[]'),
+      secrets: JSON.parse(r.secrets || '[]'),
+      networks: JSON.parse(r.networks || '[]'),
+      approved_at: r.approved_at
+    }));
+  }
+
   listRecentRequests(limit = 20): ExecutionRecord[] {
     return this.db.prepare('SELECT * FROM execution_requests ORDER BY created_at DESC LIMIT ?').all(limit) as ExecutionRecord[];
   }
@@ -333,6 +365,8 @@ export class ProxyDatabase {
     this.db.close();
   }
 }
+
+import { PolicyConstraint } from './policy.js';
 
 export interface SessionPolicy {
   allowedSecrets: string[];
@@ -343,4 +377,5 @@ export interface SessionPolicy {
   description?: string;
   approvedCodeHash?: string;
   approvedAnalysisSummary?: string;
+  structuredConstraints?: PolicyConstraint[];
 }

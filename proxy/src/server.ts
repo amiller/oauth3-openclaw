@@ -7,6 +7,7 @@ import express, { Request, Response } from 'express';
 import { ProxyDatabase, SessionPolicy } from './database.js';
 import { executeSkill, hashCode, parseMetadata, EXECUTOR_MODE } from './executor.js';
 import { analyzeCode, CodeAnalysis, reviewCode, CodeReview, reviewInvocation, checkPolicyCompliance, reviewArgs, tokenUsage } from './analyzer.js';
+import { PolicyConstraint, enforceStrict, enforceSoft, isStructuredConstraint, splitConstraints } from './policy.js';
 import { randomBytes } from 'crypto';
 
 const app = express();
@@ -33,7 +34,7 @@ console.log(`🔑 Loaded ${Object.keys(secrets).length} secrets from database`);
 
 // Session tracking for pending requests
 // Helper: reconstruct scope request data from DB (survives restarts)
-function getScopeRequest(requestId: string): { sessionId: string; description: string; constraints: string[]; secrets: string[]; networks: string[]; skill_code?: string; codeHash?: string; analysisSummary?: string } | null {
+function getScopeRequest(requestId: string): { sessionId: string; description: string; constraints: string[]; structuredConstraints: PolicyConstraint[]; secrets: string[]; networks: string[]; skill_code?: string; codeHash?: string; analysisSummary?: string } | null {
   const request = db.getRequest(requestId);
   if (!request || request.skill_url !== 'scope') return null;
   try {
@@ -41,7 +42,11 @@ function getScopeRequest(requestId: string): { sessionId: string; description: s
     if (!code) return null;
     const data = JSON.parse(code);
     const args = request.args ? JSON.parse(request.args) : {};
-    return { sessionId: args.sessionId || '', description: data.description || '', constraints: data.constraints || [], secrets: data.secrets || [], networks: data.networks || [], skill_code: data.skill_code, codeHash: data.codeHash, analysisSummary: data.analysisSummary };
+    // Separate typed constraints from legacy string constraints
+    const rawConstraints: any[] = data.constraints || [];
+    const structuredConstraints: PolicyConstraint[] = rawConstraints.filter(isStructuredConstraint);
+    const legacyConstraints: string[] = rawConstraints.filter((c: any) => typeof c === 'string');
+    return { sessionId: args.sessionId || '', description: data.description || '', constraints: legacyConstraints, structuredConstraints, secrets: data.secrets || [], networks: data.networks || [], skill_code: data.skill_code, codeHash: data.codeHash, analysisSummary: data.analysisSummary };
   } catch { return null; }
 }
 
@@ -63,11 +68,35 @@ function structuralPolicyCheck(analysis: CodeAnalysis, policy: SessionPolicy): {
 async function skillFitsPolicy(code: string, metadata: any, analysis: CodeAnalysis, policy: SessionPolicy, args?: Record<string, any>, codeHash?: string): Promise<{ fits: boolean; violations?: string[] }> {
   const structural = structuralPolicyCheck(analysis, policy);
 
+  // Structured constraints path — deterministic enforcement first, then soft
+  if (policy.structuredConstraints?.length && args && Object.keys(args).length) {
+    if (!structural.pass) console.log(`  Structural gaps ignored (human-approved structured policy): ${structural.gaps.join(', ')}`);
+    const { strict, soft } = splitConstraints(policy.structuredConstraints);
+
+    // Step 1: Deterministic regex/predicate check — no LLM
+    const strictResult = enforceStrict(strict, args);
+    if (!strictResult.pass) {
+      console.log(`  Strict constraint violations: ${strictResult.violations.join(', ')}`);
+      return { fits: false, violations: strictResult.violations };
+    }
+    console.log(`  Strict constraints passed (${strict.length} checked)`);
+
+    // Step 2: Soft constraints — trusted Haiku reviewer sees only approved rules + args
+    if (soft.length) {
+      const softResult = await enforceSoft(soft, args);
+      if (!softResult.pass) {
+        console.log(`  Soft constraint violations: ${softResult.violations.join(', ')}`);
+        return { fits: false, violations: softResult.violations };
+      }
+      console.log(`  Soft constraints passed (${soft.length} checked)`);
+    }
+
+    return { fits: true };
+  }
+
   // Pre-approved code path: code was submitted with scope and human approved the package
-  // Skip structural check — human already approved this exact code and its resource usage
   if (policy.approvedCodeHash && codeHash === policy.approvedCodeHash && policy.constraints?.length) {
     if (!structural.pass) console.log(`  Pre-approved code, structural gaps ignored (human-approved): ${structural.gaps.join(', ')}`);
-    // Code is pre-approved — only check args against constraints
     const summary = policy.approvedAnalysisSummary || analysis.summary;
     if (args && Object.keys(args).length) {
       console.log(`  Pre-approved code (hash match), checking args against ${policy.constraints.length} constraints`);
@@ -75,16 +104,14 @@ async function skillFitsPolicy(code: string, metadata: any, analysis: CodeAnalys
       console.log(`  Args review: compliant=${compliance.compliant}${compliance.violations?.length ? ` violations=${compliance.violations.join(', ')}` : ''}`);
       return { fits: compliance.compliant, violations: compliance.violations };
     }
-    // No args — code is pre-approved and no parameters to check
     console.log(`  Pre-approved code (hash match), no args — auto-approving`);
     return { fits: true };
   }
 
-  // Explicit scope sessions (with constraints): full review (code NOT pre-approved)
+  // Explicit scope sessions (with legacy string constraints): full review
   if (policy.constraints?.length) {
     if (!structural.pass) console.log(`  Structural gaps (deferred to review): ${structural.gaps.join(', ')}`);
 
-    // Call 2: Code review (cached) — is the code faithful and well-behaved?
     const reviewCache = {
       get: (h: string) => db.getCodeReview(h),
       set: (h: string, r: CodeReview) => db.setCodeReview(h, r)
@@ -101,15 +128,22 @@ async function skillFitsPolicy(code: string, metadata: any, analysis: CodeAnalys
       console.log(`  Code review: faithful, params=[${review.parameterized.join(',')}] hardcoded=${JSON.stringify(review.hardcoded)}`);
     }
 
-    // Call 3: Invocation review (per-call) — are these specific args within bounds?
     if (args && Object.keys(args).length) {
       const compliance = await reviewInvocation(review, analysis, metadata, policy.constraints, args);
       return { fits: compliance.compliant, violations: compliance.violations };
     }
 
-    // Fallback: no args, use legacy combined check
     const compliance = await checkPolicyCompliance(code, metadata, policy.constraints);
     return { fits: compliance.compliant, violations: compliance.violations };
+  }
+
+  // Structured constraints but no args — auto-approve if only strict constraints
+  if (policy.structuredConstraints?.length) {
+    const { soft } = splitConstraints(policy.structuredConstraints);
+    if (!soft.length) {
+      console.log(`  Structured policy, no args, no soft constraints — auto-approving`);
+      return { fits: true };
+    }
   }
 
   // Implicit sessions (no constraints): structural check is the only gatekeeper
@@ -258,23 +292,41 @@ Response: \`{ request_id, status, result, error }\`
 - \`result.duration\` — ms
 
 ### POST /scope — request a scope (session with constraints)
+
+Constraints can be **typed** (preferred) or plain strings (legacy). Typed constraints enable
+deterministic enforcement — regex and predicate constraints are checked instantly with zero LLM cost.
+Only \`natural_language\` constraints require a runtime Haiku call.
+
 \`\`\`json
 {
-  "description": "GitHub access for owockibot bounty",
+  "description": "GitHub access for amiller repos",
   "constraints": [
-    "Only create or modify repositories under the owockibot organization",
-    "Maximum 2 new repository creations",
-    "No destructive actions: no repo deletion, force push, or branch deletion"
+    { "type": "regex", "param": "repo", "pattern": "^amiller/.*$", "rationale": "Only amiller repos" },
+    { "type": "predicate", "param": "action", "op": "in", "value": ["list", "create"], "rationale": "Read + create only" },
+    { "type": "natural_language", "rule": "Skip issues labeled keep-open", "rationale": "Respect manual overrides" }
   ],
   "secrets": ["GH_TOKEN"],
   "networks": ["api.github.com"],
   "session_id": "optional-reuse-existing"
 }
 \`\`\`
+
+**Constraint types:**
+- \`regex\` — \`param\` value must match \`pattern\`. Deterministic, instant.
+- \`predicate\` — operators: \`>=\`, \`<=\`, \`==\`, \`!=\`, \`in\`, \`prefix\`, \`suffix\`. Deterministic, instant.
+- \`natural_language\` — free-text rule, checked by isolated Haiku reviewer at runtime. Costs ~$0.001/call.
+
+Plain string constraints still work (treated as \`natural_language\`).
+
+**Prefer \`regex\`/\`predicate\`** — they're faster, cheaper, and the human can verify the exact rule.
+
+**Incremental scopes:** Call \`POST /scope\` again with the same \`session_id\` to add capabilities.
+The human sees the delta. Session accumulates approved policies. Secrets/networks can only be added.
+
 Returns \`{ request_id, status: "pending_scope", session_id, approval_url }\`.
 Human approves the scope at the URL. Once approved, a session is created with
 those constraints. Subsequent \`/execute\` calls with the same \`session_id\` are
-auto-approved if they pass both structural checks AND Haiku constraint review.
+auto-approved if they pass constraint checks.
 
 ### POST /execute with dry_run
 Same body as above, add \`"dry_run": true\`. Returns what *would* happen without creating a request:
@@ -617,39 +669,72 @@ app.get('/approve/:id', (req: Request, res: Response) => {
   // Scope request approval page
   const scopeReq = getScopeRequest(id);
   if (scopeReq && request.status === 'pending') {
+    const hasStructured = scopeReq.structuredConstraints.length > 0;
+    const renderConstraint = (c: PolicyConstraint) => {
+      if (c.type === 'regex') return `<div class="constraint strict">✅ <code>${esc(c.param)}</code> matches <code>/${esc(c.pattern)}/</code><br><small class="rationale">${esc(c.rationale)}</small></div>`;
+      if (c.type === 'predicate') return `<div class="constraint strict">✅ <code>${esc(c.param)}</code> ${esc(c.op)} <code>${esc(JSON.stringify(c.value))}</code><br><small class="rationale">${esc(c.rationale)}</small></div>`;
+      return `<div class="constraint soft">⚠️ <span class="runtime-tag">[runtime-checked]</span> ${esc(c.rule)}<br><small class="rationale">${esc(c.rationale)}</small></div>`;
+    };
+
     return res.type('html').send(`<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Approve Scope</title>
+<title>Approve Policy</title>
 <style>
 body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;margin:0;padding:1.5em;max-width:700px;margin:0 auto}
-h1{color:#89b4fa;font-size:1.2em} .meta{color:#6c7086;margin-bottom:1em}
-.constraint{background:#181825;padding:0.6em 1em;border-radius:6px;border-left:3px solid #f9e2af;margin:0.4em 0}
-.section{margin:1em 0} .section b{color:#a6adc8}
+h1{color:#89b4fa;font-size:1.2em} .meta{color:#6c7086}
+.policy-box{background:#181825;border-radius:8px;padding:1.2em;margin:1em 0;border:1px solid #313244}
+.policy-box h2{margin:0 0 0.5em;font-size:1em;color:#cdd6f4}
+.policy-desc{color:#a6adc8;margin-bottom:1em}
+.resource-row{display:flex;gap:2em;margin:0.8em 0;flex-wrap:wrap}
+.resource-col b{color:#6c7086;font-size:0.85em;text-transform:uppercase;letter-spacing:0.05em}
+.tag{display:inline-block;padding:0.2em 0.6em;border-radius:4px;font-size:0.85em;margin:0.15em}
+.secret{background:#f38ba820;color:#f38ba8} .network{background:#89b4fa20;color:#89b4fa}
+.constraint{padding:0.5em 0.8em;border-radius:6px;margin:0.3em 0;font-size:0.9em}
+.constraint.strict{background:#a6e3a110;border-left:3px solid #a6e3a1}
+.constraint.soft{background:#f9e2af10;border-left:3px solid #f9e2af}
+.constraint.legacy{background:#181825;border-left:3px solid #f9e2af}
+.runtime-tag{color:#f9e2af;font-size:0.8em}
+.rationale{color:#6c7086}
+.section{margin:1em 0}
 .actions{margin:1.5em 0;display:flex;gap:0.5em;flex-wrap:wrap}
 button{font-family:monospace;font-size:1em;padding:0.6em 1.2em;border:none;border-radius:6px;cursor:pointer}
 .approve{background:#a6e3a1;color:#1e1e2e} .deny{background:#f38ba8;color:#1e1e2e}
-.tag{display:inline-block;padding:0.15em 0.5em;border-radius:4px;font-size:0.85em;margin:0.1em}
-.secret{background:#f38ba820;color:#f38ba8} .network{background:#89b4fa20;color:#89b4fa}
+details{margin-top:1em} summary{cursor:pointer;color:#89b4fa;font-size:0.9em}
 </style></head><body>
-<h1>🔐 Scope Request</h1>
+<h1>🔐 Policy Proposal</h1>
 <form method="POST">
 <input type="hidden" name="token" value="${esc(token)}">
 <input type="hidden" name="action" value="approve">
 <input type="hidden" name="level" value="scope">
-<div class="section"><b>Description:</b><br>${esc(scopeReq.description)}</div>
-<div class="section"><b>Secrets:</b> ${scopeReq.secrets.map(s => {
+
+<div class="policy-box">
+<h2>${esc(scopeReq.description)}</h2>
+
+<div class="resource-row">
+<div class="resource-col"><b>Secrets</b><br>${scopeReq.secrets.map(s => {
     const stored = db.getAllSecrets()[s];
     return stored
-      ? `<span class="tag secret">${esc(s)} ✅</span>`
-      : `<div style="margin:0.4em 0"><label><code>${esc(s)}</code></label><br><input type="password" name="secret_${esc(s)}" placeholder="Enter ${esc(s)}" style="width:100%;padding:0.5em;background:#181825;border:1px solid #313244;color:#cdd6f4;border-radius:4px;font-family:monospace"><small style="color:#6c7086"> required</small></div>`;
-  }).join(' ') || 'none'}</div>
-<div class="section"><b>Networks:</b> ${scopeReq.networks.map(n => `<span class="tag network">${esc(n)}</span>`).join(' ') || 'none'}</div>
-<div class="section"><b>Constraints:</b>
-${scopeReq.constraints.map(c => `<div class="constraint">${esc(c)}</div>`).join('')}
-${!scopeReq.constraints.length ? '<div class="meta">No constraints specified</div>' : ''}
+      ? `<span class="tag secret">🔑 ${esc(s)}</span>`
+      : `<div style="margin:0.3em 0"><span class="tag secret">🔑 ${esc(s)}</span><br><input type="password" name="secret_${esc(s)}" placeholder="Enter ${esc(s)}" style="width:100%;padding:0.4em;background:#1e1e2e;border:1px solid #313244;color:#cdd6f4;border-radius:4px;font-family:monospace;margin-top:0.2em"></div>`;
+  }).join('') || '<span class="meta">none</span>'}</div>
+<div class="resource-col"><b>Networks</b><br>${scopeReq.networks.map(n => `<span class="tag network">🌐 ${esc(n)}</span>`).join('') || '<span class="meta">none</span>'}</div>
 </div>
-${scopeReq.skill_code ? `<div class="section"><b>Skill Code:</b>${scopeReq.analysisSummary ? `<div class="constraint" style="border-color:#89b4fa">${esc(scopeReq.analysisSummary)}</div>` : ''}<pre style="background:#181825;padding:1em;border-radius:8px;overflow-x:auto;font-size:0.85em">${esc(scopeReq.skill_code)}</pre></div>` : ''}
-<div class="actions"><button type="submit" class="approve">✅ Approve Scope</button></div>
+
+${hasStructured ? `<div style="margin-top:1em"><b style="color:#6c7086;font-size:0.85em;text-transform:uppercase">Constraints</b>
+${scopeReq.structuredConstraints.map(renderConstraint).join('')}
+</div>` : ''}
+${scopeReq.constraints.length ? `<div style="margin-top:${hasStructured ? '0.5' : '1'}em">${!hasStructured ? '<b style="color:#6c7086;font-size:0.85em;text-transform:uppercase">Constraints</b>' : ''}
+${scopeReq.constraints.map(c => `<div class="constraint legacy">⚠️ ${esc(c)}</div>`).join('')}
+</div>` : ''}
+${!hasStructured && !scopeReq.constraints.length ? '<div class="meta" style="margin-top:0.5em">No constraints specified</div>' : ''}
+</div>
+
+${scopeReq.skill_code ? `<details><summary>▶ View Code</summary>
+${scopeReq.analysisSummary ? `<div class="constraint" style="background:#181825;border-left:3px solid #89b4fa;margin:0.5em 0">${esc(scopeReq.analysisSummary)}</div>` : ''}
+<pre style="background:#181825;padding:1em;border-radius:8px;overflow-x:auto;font-size:0.85em">${esc(scopeReq.skill_code)}</pre>
+</details>` : ''}
+
+<div class="actions"><button type="submit" class="approve">✅ Approve</button></div>
 </form>
 <form method="POST">
   <input type="hidden" name="token" value="${esc(token)}">
@@ -761,31 +846,54 @@ app.post('/approve/:id', async (req: Request, res: Response) => {
     if (key.startsWith('secret_') && req.body[key]) { const n = key.slice(7); secrets[n] = req.body[key]; db.setSecret(n, req.body[key]); }
   }
 
-  // Scope request approval — create session with constraints
+  // Scope request approval — create or extend session with constraints
   const scopeReq = getScopeRequest(id);
   if (scopeReq) {
-    const policy: SessionPolicy = {
-      allowedSecrets: scopeReq.secrets,
-      allowedNetworks: scopeReq.networks,
-      allowMutating: true,
-      maxRiskLevel: 'medium',
-      constraints: scopeReq.constraints,
-      description: scopeReq.description,
-      approvedCodeHash: scopeReq.codeHash,
-      approvedAnalysisSummary: scopeReq.analysisSummary,
-    };
-    db.createSession(scopeReq.sessionId, policy);
+    const allConstraints = [...scopeReq.structuredConstraints];
+    // Convert legacy string constraints to natural_language
+    for (const c of scopeReq.constraints) allConstraints.push({ type: 'natural_language', rule: c, rationale: '' });
+
+    const existingSession = db.getSession(scopeReq.sessionId);
+    if (existingSession) {
+      // Incremental scope: merge into existing session
+      const p = existingSession.policy;
+      p.allowedSecrets = [...new Set([...p.allowedSecrets, ...scopeReq.secrets])];
+      p.allowedNetworks = [...new Set([...p.allowedNetworks, ...scopeReq.networks])];
+      p.structuredConstraints = [...(p.structuredConstraints || []), ...allConstraints];
+      if (scopeReq.constraints.length) p.constraints = [...(p.constraints || []), ...scopeReq.constraints];
+      if (scopeReq.codeHash) p.approvedCodeHash = scopeReq.codeHash;
+      if (scopeReq.analysisSummary) p.approvedAnalysisSummary = scopeReq.analysisSummary;
+      db.updateSessionPolicy(scopeReq.sessionId, p);
+    } else {
+      const policy: SessionPolicy = {
+        allowedSecrets: scopeReq.secrets,
+        allowedNetworks: scopeReq.networks,
+        allowMutating: true,
+        maxRiskLevel: 'medium',
+        constraints: scopeReq.constraints.length ? scopeReq.constraints : undefined,
+        description: scopeReq.description,
+        approvedCodeHash: scopeReq.codeHash,
+        approvedAnalysisSummary: scopeReq.analysisSummary,
+        structuredConstraints: allConstraints.length ? allConstraints : undefined,
+      };
+      db.createSession(scopeReq.sessionId, policy);
+    }
+
+    // Record the scope grant
+    db.addScopeGrant(scopeReq.sessionId, scopeReq.description, allConstraints, scopeReq.secrets, scopeReq.networks);
+
     db.updateRequestStatus(id, 'completed');
     notifyStatusWaiters(id);
-    console.log(`📋 Scope approved, session ${scopeReq.sessionId} created with ${scopeReq.constraints.length} constraints${scopeReq.codeHash ? `, code hash ${scopeReq.codeHash.substring(0, 16)}` : ''}`);
+    const totalConstraints = allConstraints.length;
+    console.log(`📋 Scope approved, session ${scopeReq.sessionId} ${existingSession ? 'expanded' : 'created'} with ${totalConstraints} constraints${scopeReq.codeHash ? `, code hash ${scopeReq.codeHash.substring(0, 16)}` : ''}`);
 
     return res.type('html').send(`<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <style>body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;padding:2em;text-align:center}
 a{color:#89b4fa}</style>
-</head><body><h2>✅ Scope Approved</h2>
-<p>Session <code>${esc(scopeReq.sessionId)}</code> created.</p>
-<p>${scopeReq.constraints.length} constraints active.</p>
+</head><body><h2>✅ ${existingSession ? 'Scope Expanded' : 'Scope Approved'}</h2>
+<p>Session <code>${esc(scopeReq.sessionId)}</code> ${existingSession ? 'updated' : 'created'}.</p>
+<p>${totalConstraints} constraints active.</p>
 <p><a href="${dashboardUrl}">View Dashboard</a></p>
 </body></html>`);
   }
@@ -922,13 +1030,15 @@ app.post('/execute', requireAuth, async (req: Request, res: Response) => {
       analysis = await analyzeCode(code, metadata, codeHash, cache);
     }
 
-    // Check session policy (structural + Haiku constraint check)
+    // Check session policy (structured constraints don't need analysis)
     let policyViolations: string[] | undefined;
     const session = db.getSession(sessionId);
-    if (session && analysis) {
-      console.log(`📋 Checking session ${sessionId}: secrets=${JSON.stringify(session.policy.allowedSecrets)} networks=${JSON.stringify(session.policy.allowedNetworks)} constraints=${session.policy.constraints?.length || 0}`);
-      console.log(`   Analysis: secrets=${JSON.stringify(analysis.secretsUsed)} networks=${JSON.stringify(analysis.networkTargets)} risk=${analysis.riskLevel}`);
-      const { fits, violations } = await skillFitsPolicy(code, metadata, analysis, session.policy, args, codeHash);
+    if (session && (analysis || session.policy.structuredConstraints?.length)) {
+      const sc = session.policy.structuredConstraints?.length || 0;
+      console.log(`📋 Checking session ${sessionId}: secrets=${JSON.stringify(session.policy.allowedSecrets)} networks=${JSON.stringify(session.policy.allowedNetworks)} constraints=${session.policy.constraints?.length || 0} structured=${sc}`);
+      if (analysis) console.log(`   Analysis: secrets=${JSON.stringify(analysis.secretsUsed)} networks=${JSON.stringify(analysis.networkTargets)} risk=${analysis.riskLevel}`);
+      const dummyAnalysis: CodeAnalysis = analysis || { summary: '', secretsUsed: [], networkTargets: [], isMutating: false, riskLevel: 'low', concerns: [], timestamp: Date.now() };
+      const { fits, violations } = await skillFitsPolicy(code, metadata, dummyAnalysis, session.policy, args, codeHash);
       if (fits) {
         if (dry_run) return res.json({ dry_run: true, would_auto_approve: true, reason: 'session_policy', session_id: sessionId, analysis });
         console.log(`⚡ Auto-approved via session ${sessionId}: ${skill_id}`);
@@ -953,10 +1063,11 @@ app.post('/execute', requireAuth, async (req: Request, res: Response) => {
       return res.json({
         dry_run: true,
         would_auto_approve: false,
-        reason: 'needs_approval',
+        reason: policyViolations?.length ? 'policy_violation' : 'needs_approval',
         session_id: sessionId,
         session_exists: !!session,
         analysis,
+        policy_violations: policyViolations,
         policy_gaps: session && analysis ? {
           new_secrets: analysis.secretsUsed.filter(s => !session.policy.allowedSecrets.includes(s)),
           new_networks: analysis.networkTargets.filter(n => !session.policy.allowedNetworks.includes(n)),
