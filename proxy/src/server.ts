@@ -8,12 +8,38 @@ import { ProxyDatabase, SessionPolicy } from './database.js';
 import { executeSkill, hashCode, parseMetadata, EXECUTOR_MODE } from './executor.js';
 import { analyzeCode, CodeAnalysis, reviewCode, CodeReview, reviewInvocation, checkPolicyCompliance, reviewArgs, tokenUsage } from './analyzer.js';
 import { PolicyConstraint, enforceStrict, enforceSoft, isStructuredConstraint, splitConstraints } from './policy.js';
+import { requireTenant, handleSignup, TenantContext } from './auth.js';
+import * as pgLog from './postgres.js';
 import { randomBytes } from 'crypto';
 
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use((_req, res, next) => { res.setHeader('Referrer-Policy', 'no-referrer'); next(); });
+
+// CORS for web client (oauth3.app or custom origin)
+const CORS_ORIGIN = process.env.CORS_ORIGIN || 'https://oauth3.app';
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && (CORS_ORIGIN === '*' || CORS_ORIGIN.split(',').includes(origin))) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+    res.setHeader('Access-Control-Max-Age', '86400');
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+// Sync tenant context to db + Postgres after auth
+function syncTenant(req: Request, _res: Response, next: () => void) {
+  const tenant = (req as any).tenant as TenantContext | undefined;
+  if (tenant) {
+    db.tenantId = tenant.tenant_id;
+    pgLog.ensureTenant(tenant.tenant_id, tenant.plan);
+  }
+  next();
+}
 
 // Config from environment
 const PORT = parseInt(process.env.PORT || '3737');
@@ -413,152 +439,21 @@ Executor: ${EXECUTOR_MODE} mode
 `);
 });
 
-// Dashboard — human-facing session/execution browser
-app.get('/dashboard', (req: Request, res: Response) => {
-  if (API_BEARER_TOKEN && req.query.token !== API_BEARER_TOKEN) return res.status(401).send('Unauthorized — append ?token=...');
+// Health check
+app.get('/health', (_req: Request, res: Response) => res.json({ status: 'ok', executor: EXECUTOR_MODE }));
+
+// Standalone signup (only available when no JWT_SECRET configured)
+app.post('/signup', handleSignup);
+
+// Dashboard data (JSON API — UI served by orchestrator)
+app.get('/dashboard', requireTenant, syncTenant, (req: Request, res: Response) => {
   const sessions = db.listSessions();
   const requests = db.listRecentRequests(30);
-  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const orchUrl = req.headers['x-orchestrator-url'] as string | undefined;
-  const orchTenant = req.headers['x-tenant-id'] as string | undefined;
-  const B = orchUrl && orchTenant ? `${orchUrl}/t/${orchTenant}` : '';
-  const ago = (ts: number) => {
-    const m = Math.round((Date.now() - ts) / 60000);
-    return m < 60 ? `${m}m ago` : `${Math.round(m / 60)}h ago`;
-  };
-  const statusIcon: Record<string, string> = { completed: '✅', failed: '❌', denied: '🚫', pending: '⏳', approved: '🔄', executing: '⚙️', awaiting_secrets: '🔑' };
-
-  res.type('html').send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>OAuth3 Dashboard</title>
-<style>
-body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;margin:0;padding:1.5em;max-width:900px;margin:0 auto}
-h1{color:#89b4fa;font-size:1.3em} h2{color:#a6adc8;font-size:1.1em;margin-top:2em}
-table{width:100%;border-collapse:collapse;font-size:0.85em}
-th{text-align:left;color:#6c7086;border-bottom:1px solid #313244;padding:0.4em 0.6em}
-td{padding:0.4em 0.6em;border-bottom:1px solid #181825}
-tr:hover{background:#181825}
-.tag{display:inline-block;padding:0.15em 0.5em;border-radius:4px;font-size:0.8em}
-.secret{background:#f38ba820;color:#f38ba8} .network{background:#89b4fa20;color:#89b4fa}
-.risk-low{color:#a6e3a1} .risk-medium{color:#f9e2af} .risk-high{color:#f38ba8}
-a{color:#89b4fa;text-decoration:none} a:hover{text-decoration:underline}
-.btn{font-family:monospace;font-size:0.8em;padding:0.3em 0.6em;border:1px solid #f38ba8;color:#f38ba8;background:none;border-radius:4px;cursor:pointer}
-.btn:hover{background:#f38ba820}
-.empty{color:#6c7086;font-style:italic}
-</style></head><body>
-<h1>OAuth3 Dashboard</h1>
-
-<h2>Active Sessions (${sessions.length})</h2>
-${sessions.length === 0 ? '<p class="empty">No active sessions</p>' : `<table>
-<tr><th>Session</th><th>Age</th><th>Idle</th><th>Secrets</th><th>Networks</th><th>Risk</th><th></th></tr>
-${sessions.map(s => `<tr>
-<td><a href="${B}/dashboard/session/${esc(s.session_id)}?token=${esc(API_BEARER_TOKEN)}"><code>${esc(s.session_id.substring(0, 20))}</code></a>${s.policy.description ? `<br><small>${esc(s.policy.description.substring(0, 60))}</small>` : ''}</td>
-<td>${ago(s.created_at)}</td>
-<td>${ago(s.last_activity)}</td>
-<td>${s.policy.allowedSecrets.map((x: string) => `<span class="tag secret">${esc(x)}</span>`).join(' ') || '—'}</td>
-<td>${s.policy.allowedNetworks.map((x: string) => `<span class="tag network">${esc(x)}</span>`).join(' ') || '—'}</td>
-<td class="risk-${s.policy.maxRiskLevel}">${s.policy.maxRiskLevel}${s.policy.constraints?.length ? `<br><small>${s.policy.constraints.length} constraints</small>` : ''}</td>
-<td><form method="POST" action="${B}/dashboard/revoke?token=${esc(API_BEARER_TOKEN)}" style="display:inline">
-<input type="hidden" name="session_id" value="${esc(s.session_id)}">
-<button class="btn" type="submit">revoke</button></form></td>
-</tr>`).join('')}
-</table>`}
-
-<h2>Recent Executions</h2>
-${requests.length === 0 ? '<p class="empty">No executions yet</p>' : `<table>
-<tr><th>ID</th><th>Skill</th><th>Status</th><th>When</th><th></th></tr>
-${requests.map(r => `<tr>
-<td><code>${esc(r.id.substring(0, 16))}</code></td>
-<td>${esc(r.skill_id)}</td>
-<td>${statusIcon[r.status] || '?'} ${esc(r.status)}</td>
-<td>${ago(r.created_at)}</td>
-<td>${r.code_hash ? `<a href="${B}/view/${esc(r.id)}?token=${esc(API_BEARER_TOKEN)}">code</a>` : ''}</td>
-</tr>`).join('')}
-</table>`}
-
-<p style="color:#6c7086;margin-top:2em;font-size:0.8em">Sessions expire after 2h of inactivity. <a href="${B}/dashboard?token=${esc(API_BEARER_TOKEN)}">Refresh</a></p>
-</body></html>`);
-});
-
-// Dashboard revoke action
-app.post('/dashboard/revoke', (req: Request, res: Response) => {
-  if (API_BEARER_TOKEN && req.query.token !== API_BEARER_TOKEN) return res.status(401).send('Unauthorized');
-  const { session_id } = req.body;
-  if (session_id) db.deleteSession(session_id);
-  const orchUrl = req.headers['x-orchestrator-url'] as string | undefined;
-  const orchTenant = req.headers['x-tenant-id'] as string | undefined;
-  const B = orchUrl && orchTenant ? `${orchUrl}/t/${orchTenant}` : '';
-  res.redirect(`/dashboard?token=${API_BEARER_TOKEN}`);
-});
-
-// Session detail page
-app.get('/dashboard/session/:id', (req: Request, res: Response) => {
-  if (API_BEARER_TOKEN && req.query.token !== API_BEARER_TOKEN) return res.status(401).send('Unauthorized');
-  const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
-  const session = db.getSession(id);
-  if (!session) return res.status(404).send('Session not found or expired');
-  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const orchUrl = req.headers['x-orchestrator-url'] as string | undefined;
-  const orchTenant = req.headers['x-tenant-id'] as string | undefined;
-  const B = orchUrl && orchTenant ? `${orchUrl}/t/${orchTenant}` : '';
-  const p = session.policy;
-
-  res.type('html').send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Session: ${esc(id.substring(0, 20))}</title>
-<style>
-body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;margin:0;padding:1.5em;max-width:700px;margin:0 auto}
-h1{color:#89b4fa;font-size:1.2em} h2{color:#a6adc8;font-size:1em;margin-top:1.5em}
-.tag{display:inline-block;padding:0.15em 0.5em;border-radius:4px;font-size:0.85em;margin:0.1em}
-.secret{background:#f38ba820;color:#f38ba8} .network{background:#89b4fa20;color:#89b4fa}
-.constraint{background:#181825;padding:0.6em 1em;border-radius:6px;border-left:3px solid #f9e2af;margin:0.4em 0}
-.meta{color:#6c7086} .section{margin:1em 0}
-a{color:#89b4fa;text-decoration:none} a:hover{text-decoration:underline}
-.risk-low{color:#a6e3a1} .risk-medium{color:#f9e2af} .risk-high{color:#f38ba8}
-.btn{font-family:monospace;font-size:0.85em;padding:0.4em 0.8em;border:1px solid #f38ba8;color:#f38ba8;background:none;border-radius:4px;cursor:pointer}
-</style></head><body>
-<p><a href="${B}/dashboard?token=${esc(API_BEARER_TOKEN)}">&larr; Dashboard</a></p>
-<h1>Session</h1>
-<div class="meta"><code>${esc(id)}</code></div>
-${p.description ? `<div class="section"><b>Description:</b> ${esc(p.description)}</div>` : ''}
-<div class="section"><b>Created:</b> ${new Date(session.created_at).toISOString()}<br>
-<b>Last activity:</b> ${new Date(session.last_activity).toISOString()}<br>
-<b>Idle:</b> ${Math.round((Date.now() - session.last_activity) / 60000)} min</div>
-
-<h2>Policy</h2>
-<div class="section">
-<b>Secrets:</b> ${p.allowedSecrets.map(s => `<span class="tag secret">${esc(s)}</span>`).join(' ') || '<span class="meta">none</span>'}<br>
-<b>Networks:</b> ${p.allowedNetworks.map(n => `<span class="tag network">${esc(n)}</span>`).join(' ') || '<span class="meta">none</span>'}<br>
-<b>Mutating:</b> ${p.allowMutating ? 'yes' : 'no'}<br>
-<b>Max risk:</b> <span class="risk-${p.maxRiskLevel}">${p.maxRiskLevel}</span>
-</div>
-
-${p.constraints?.length ? `<h2>Constraints (${p.constraints.length})</h2>
-${p.constraints.map(c => `<div class="constraint">${esc(c)}</div>`).join('')}` : ''}
-
-${p.approvedCodeHash ? `<h2>Pre-approved Code</h2>
-<div class="section">
-<b>Code hash:</b> <code>${esc(p.approvedCodeHash.substring(0, 32))}...</code><br>
-${p.approvedAnalysisSummary ? `<b>Analysis:</b> ${esc(p.approvedAnalysisSummary)}<br>` : ''}
-<small class="meta">Executions matching this hash auto-approve — only args are checked against constraints.</small>
-</div>` : ''}
-
-<h2>Haiku Token Usage</h2>
-<div class="section">
-<b>Calls:</b> ${tokenUsage.calls} | <b>Input:</b> ${tokenUsage.inputTokens} tokens | <b>Output:</b> ${tokenUsage.outputTokens} tokens
-<br><small class="meta">Cumulative since last proxy restart. Haiku 4.5: $0.80/1M input, $4/1M output.</small>
-</div>
-
-<div class="section" style="margin-top:2em">
-<form method="POST" action="${B}/dashboard/revoke?token=${esc(API_BEARER_TOKEN)}">
-<input type="hidden" name="session_id" value="${esc(id)}">
-<button class="btn" type="submit">Revoke Session</button>
-</form></div>
-</body></html>`);
+  res.json({ sessions, requests });
 });
 
 // Add secret — persists to SQLite
-app.post('/secrets', requireAuth, (req: Request, res: Response) => {
+app.post('/secrets', requireTenant, syncTenant, (req: Request, res: Response) => {
   const { name, value } = req.body;
   if (!name || !value) return res.status(400).json({ error: 'Missing name or value' });
   secrets[name] = value;
@@ -567,24 +462,27 @@ app.post('/secrets', requireAuth, (req: Request, res: Response) => {
 });
 
 // List secrets (names only)
-app.get('/secrets', requireAuth, (req: Request, res: Response) => {
+app.get('/secrets', requireTenant, syncTenant, (req: Request, res: Response) => {
   res.json({ secrets: Object.keys(secrets) });
 });
 
-// Bearer token auth for internal endpoints
-function requireAuth(req: Request, res: Response, next: Function) {
-  if (!API_BEARER_TOKEN) return next(); // no token configured = open access (dev mode)
-  const auth = req.headers.authorization;
-  if (auth === `Bearer ${API_BEARER_TOKEN}`) return next();
-  res.status(401).json({ error: 'Unauthorized' });
-}
+app.delete('/secrets/:name', requireTenant, syncTenant, (req: Request, res: Response) => {
+  const name = typeof req.params.name === 'string' ? req.params.name : req.params.name[0];
+  if (!secrets[name]) return res.status(404).json({ error: 'Secret not found' });
+  delete secrets[name];
+  db.deleteSecret(name);
+  res.json({ success: true, deleted: name });
+});
+
+// Auth: JWT (from orchestrator or standalone) with legacy bearer token fallback
+// Imported from ./auth.ts as requireTenant middleware
 
 // List active sessions
 app.get('/stats', (_req: Request, res: Response) => {
   res.json({ haiku_tokens: tokenUsage });
 });
 
-app.get('/sessions', requireAuth, (req: Request, res: Response) => {
+app.get('/sessions', requireTenant, syncTenant, (req: Request, res: Response) => {
   const sessions = db.listSessions();
   res.json({
     sessions: sessions.map(s => ({
@@ -599,7 +497,7 @@ app.get('/sessions', requireAuth, (req: Request, res: Response) => {
 });
 
 // Get single session
-app.get('/sessions/:id', requireAuth, (req: Request, res: Response) => {
+app.get('/sessions/:id', requireTenant, syncTenant, (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const session = db.getSession(id);
   if (!session) return res.status(404).json({ error: 'Session not found or expired' });
@@ -614,7 +512,7 @@ app.get('/sessions/:id', requireAuth, (req: Request, res: Response) => {
 });
 
 // Revoke session
-app.delete('/sessions/:id', requireAuth, (req: Request, res: Response) => {
+app.delete('/sessions/:id', requireTenant, syncTenant, (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const session = db.getSession(id);
   if (!session) return res.status(404).json({ error: 'Session not found or expired' });
@@ -622,211 +520,62 @@ app.delete('/sessions/:id', requireAuth, (req: Request, res: Response) => {
   res.json({ deleted: true, session_id: id });
 });
 
-// View code for an execution request (accepts bearer header or ?token= query param)
-app.get('/view/:id', (req: Request, res: Response, next: Function) => {
-  if (API_BEARER_TOKEN && req.query.token === API_BEARER_TOKEN) return next();
-  requireAuth(req, res, next);
-}, (req: Request, res: Response) => {
+// View code for an execution request
+app.get('/view/:id', requireTenant, syncTenant, (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const code = db.getCode(id);
-  if (!code) return res.status(404).send('Not found');
-
+  if (!code) return res.status(404).json({ error: 'Not found' });
   const request = db.getRequest(id);
   const metadata = parseMetadata(code);
-  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-
-  res.type('html').send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>${esc(metadata?.skill || id)}</title>
-<style>
-body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;margin:0;padding:1em}
-pre{background:#181825;padding:1em;border-radius:8px;overflow-x:auto;line-height:1.5}
-h1{color:#89b4fa;font-size:1.2em} .meta{color:#6c7086;margin-bottom:1em}
-</style></head><body>
-<h1>${esc(metadata?.skill || 'Skill')}</h1>
-<div class="meta">${esc(metadata?.description || '')}
-<br>Hash: ${request?.code_hash?.substring(0, 16) || '?'}...
-<br>Secrets: ${esc(metadata?.secrets?.join(', ') || 'none')}
-<br>Network: ${esc(metadata?.network?.join(', ') || 'none')}</div>
-<pre>${esc(code)}</pre>
-</body></html>`);
+  res.json({ id, code, code_hash: request?.code_hash, metadata });
 });
 
-// Web-based approval page (served from TEE)
+// Approval details (JSON API — UI served by orchestrator)
 app.get('/approve/:id', (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const token = req.query.token as string;
   const request = db.getRequest(id);
-  if (!request) return res.status(404).send('Not found');
-  if (!token || token !== request.approval_token) return res.status(403).send('Invalid token');
+  if (!request) return res.status(404).json({ error: 'Not found' });
+  if (!token || token !== request.approval_token) return res.status(403).json({ error: 'Invalid token' });
 
-  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const orchUrl = req.headers['x-orchestrator-url'] as string | undefined;
-  const orchTenant = req.headers['x-tenant-id'] as string | undefined;
-  const B = orchUrl && orchTenant ? `${orchUrl}/t/${orchTenant}` : '';
-  const dashLink = `<p style="margin-top:1.5em"><a href="${B}/dashboard?token=${esc(API_BEARER_TOKEN)}" style="color:#89b4fa">📊 Dashboard</a></p>`;
-
-  // Scope request approval page
   const scopeReq = getScopeRequest(id);
-  if (scopeReq && request.status === 'pending') {
-    const hasStructured = scopeReq.structuredConstraints.length > 0;
-    const renderConstraint = (c: PolicyConstraint) => {
-      if (c.type === 'regex') return `<div class="constraint strict">✅ <code>${esc(c.param)}</code> matches <code>/${esc(c.pattern)}/</code><br><small class="rationale">${esc(c.rationale)}</small></div>`;
-      if (c.type === 'predicate') return `<div class="constraint strict">✅ <code>${esc(c.param)}</code> ${esc(c.op)} <code>${esc(JSON.stringify(c.value))}</code><br><small class="rationale">${esc(c.rationale)}</small></div>`;
-      return `<div class="constraint soft">⚠️ <span class="runtime-tag">[runtime-checked]</span> ${esc(c.rule)}<br><small class="rationale">${esc(c.rationale)}</small></div>`;
-    };
+  const code = db.getCode(id) || undefined;
+  const metadata = code ? parseMetadata(code) : undefined;
+  const analysis = db.getAnalysis(request.code_hash);
+  const storedSecretNames = Object.keys(db.getAllSecrets());
 
-    return res.type('html').send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Approve Policy</title>
-<style>
-body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;margin:0;padding:1.5em;max-width:700px;margin:0 auto}
-h1{color:#89b4fa;font-size:1.2em} .meta{color:#6c7086}
-.policy-box{background:#181825;border-radius:8px;padding:1.2em;margin:1em 0;border:1px solid #313244}
-.policy-box h2{margin:0 0 0.5em;font-size:1em;color:#cdd6f4}
-.policy-desc{color:#a6adc8;margin-bottom:1em}
-.resource-row{display:flex;gap:2em;margin:0.8em 0;flex-wrap:wrap}
-.resource-col b{color:#6c7086;font-size:0.85em;text-transform:uppercase;letter-spacing:0.05em}
-.tag{display:inline-block;padding:0.2em 0.6em;border-radius:4px;font-size:0.85em;margin:0.15em}
-.secret{background:#f38ba820;color:#f38ba8} .network{background:#89b4fa20;color:#89b4fa}
-.constraint{padding:0.5em 0.8em;border-radius:6px;margin:0.3em 0;font-size:0.9em}
-.constraint.strict{background:#a6e3a110;border-left:3px solid #a6e3a1}
-.constraint.soft{background:#f9e2af10;border-left:3px solid #f9e2af}
-.constraint.legacy{background:#181825;border-left:3px solid #f9e2af}
-.runtime-tag{color:#f9e2af;font-size:0.8em}
-.rationale{color:#6c7086}
-.section{margin:1em 0}
-.actions{margin:1.5em 0;display:flex;gap:0.5em;flex-wrap:wrap}
-button{font-family:monospace;font-size:1em;padding:0.6em 1.2em;border:none;border-radius:6px;cursor:pointer}
-.approve{background:#a6e3a1;color:#1e1e2e} .deny{background:#f38ba8;color:#1e1e2e}
-details{margin-top:1em} summary{cursor:pointer;color:#89b4fa;font-size:0.9em}
-</style></head><body>
-<h1>🔐 Policy Proposal</h1>
-<form method="POST">
-<input type="hidden" name="token" value="${esc(token)}">
-<input type="hidden" name="action" value="approve">
-<input type="hidden" name="level" value="scope">
-
-<div class="policy-box">
-<h2>${esc(scopeReq.description)}</h2>
-
-<div class="resource-row">
-<div class="resource-col"><b>Secrets</b><br>${scopeReq.secrets.map(s => {
-    const stored = db.getAllSecrets()[s];
-    return stored
-      ? `<span class="tag secret">🔑 ${esc(s)}</span>`
-      : `<div style="margin:0.3em 0"><span class="tag secret">🔑 ${esc(s)}</span><br><input type="password" name="secret_${esc(s)}" placeholder="Enter ${esc(s)}" style="width:100%;padding:0.4em;background:#1e1e2e;border:1px solid #313244;color:#cdd6f4;border-radius:4px;font-family:monospace;margin-top:0.2em"></div>`;
-  }).join('') || '<span class="meta">none</span>'}</div>
-<div class="resource-col"><b>Networks</b><br>${scopeReq.networks.map(n => `<span class="tag network">🌐 ${esc(n)}</span>`).join('') || '<span class="meta">none</span>'}</div>
-</div>
-
-${hasStructured ? `<div style="margin-top:1em"><b style="color:#6c7086;font-size:0.85em;text-transform:uppercase">Constraints</b>
-${scopeReq.structuredConstraints.map(renderConstraint).join('')}
-</div>` : ''}
-${scopeReq.constraints.length ? `<div style="margin-top:${hasStructured ? '0.5' : '1'}em">${!hasStructured ? '<b style="color:#6c7086;font-size:0.85em;text-transform:uppercase">Constraints</b>' : ''}
-${scopeReq.constraints.map(c => `<div class="constraint legacy">⚠️ ${esc(c)}</div>`).join('')}
-</div>` : ''}
-${!hasStructured && !scopeReq.constraints.length ? '<div class="meta" style="margin-top:0.5em">No constraints specified</div>' : ''}
-</div>
-
-${scopeReq.skill_code ? `<details><summary>▶ View Code</summary>
-${scopeReq.analysisSummary ? `<div class="constraint" style="background:#181825;border-left:3px solid #89b4fa;margin:0.5em 0">${esc(scopeReq.analysisSummary)}</div>` : ''}
-<pre style="background:#181825;padding:1em;border-radius:8px;overflow-x:auto;font-size:0.85em">${esc(scopeReq.skill_code)}</pre>
-</details>` : ''}
-
-<div class="actions"><button type="submit" class="approve">✅ Approve</button></div>
-</form>
-<form method="POST">
-  <input type="hidden" name="token" value="${esc(token)}">
-  <input type="hidden" name="action" value="deny">
-  <div class="actions"><button type="submit" class="deny">❌ Deny</button></div>
-</form>
-</body></html>`);
-  }
-
-  const code = db.getCode(id) || '';
-  const metadata = parseMetadata(code);
-  const analysisData = db.getAnalysis(request.code_hash);
-  const analysisSummary = analysisData?.summary || '';
-
-  const terminal = ['completed', 'failed', 'denied', 'approved', 'executing'];
-  if (terminal.includes(request.status)) {
-    const resultData = request.result ? JSON.parse(request.result) : null;
-    return res.type('html').send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>${esc(metadata?.skill || id)}</title>
-<style>
-body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;margin:0;padding:1.5em;max-width:700px;margin:0 auto}
-pre{background:#181825;padding:1em;border-radius:8px;overflow-x:auto;line-height:1.5;font-size:0.85em}
-h1{color:#89b4fa;font-size:1.2em} .meta{color:#6c7086;margin-bottom:1em}
-.status{font-size:1.1em;margin:1em 0;padding:0.8em;border-radius:8px;background:#181825}
-</style></head><body>
-<h1>${esc(metadata?.skill || 'Skill')}</h1>
-<div class="status">${request.status === 'completed' ? '✅' : request.status === 'denied' ? '❌' : '⏳'} Status: ${esc(request.status)}${resultData?.stdout ? `\n<pre>${esc(resultData.stdout.substring(0, 500))}</pre>` : ''}${request.error ? `\n<pre>${esc(request.error.substring(0, 500))}</pre>` : ''}</div>
-${dashLink}
-</body></html>`);
-  }
-
-  res.type('html').send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Approve: ${esc(metadata?.skill || id)}</title>
-<style>
-body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;margin:0;padding:1.5em;max-width:700px;margin:0 auto}
-pre{background:#181825;padding:1em;border-radius:8px;overflow-x:auto;line-height:1.5;font-size:0.85em}
-h1{color:#89b4fa;font-size:1.2em} .meta{color:#6c7086;margin-bottom:1em}
-.actions{margin:1.5em 0;display:flex;gap:0.5em;flex-wrap:wrap}
-button{font-family:monospace;font-size:1em;padding:0.6em 1.2em;border:none;border-radius:6px;cursor:pointer}
-.approve{background:#a6e3a1;color:#1e1e2e} .approve:hover{background:#94e296}
-.trust{background:#89b4fa;color:#1e1e2e} .trust:hover{background:#74a8f7}
-.deny{background:#f38ba8;color:#1e1e2e} .deny:hover{background:#f07a9a}
-.analysis{background:#181825;padding:1em;border-radius:8px;border-left:3px solid #89b4fa;margin:1em 0}
-</style></head><body>
-<h1>${esc(metadata?.skill || 'Skill')}</h1>
-<div class="meta">
-${esc(metadata?.description || '')}
-<br>Hash: ${esc(request.code_hash.substring(0, 16))}...
-<br>Secrets: ${esc(metadata?.secrets?.join(', ') || 'none')}
-<br>Network: ${esc(metadata?.network?.join(', ') || 'none')}
-<br>Timeout: ${metadata?.timeout || 30}s
-</div>
-${analysisSummary ? `<div class="analysis"><b>Analysis:</b><br>${esc(analysisSummary)}</div>` : ''}
-<pre>${esc(code)}</pre>
-<form method="POST">
-  <input type="hidden" name="token" value="${esc(token)}">
-  <input type="hidden" name="action" value="approve">
-${(metadata?.secrets?.length) ? `<div class="section"><b>Provide Secrets:</b>${metadata.secrets.map(s => {
-    const stored = db.getAllSecrets()[s];
-    return stored
-      ? ` <span style="color:#a6e3a1"><code>${esc(s)}</code> ✅</span>`
-      : `<div style="margin:0.4em 0"><label><code>${esc(s)}</code></label><br><input type="password" name="secret_${esc(s)}" placeholder="Enter ${esc(s)}" style="width:100%;padding:0.5em;background:#181825;border:1px solid #313244;color:#cdd6f4;border-radius:4px;font-family:monospace"></div>`;
-  }).join('')}</div>` : ''}
-  <div class="actions">
-    <button type="submit" name="level" value="once" class="approve">✅ Run Once</button>
-    <button type="submit" name="level" value="trust_code" class="trust">🔒 Trust Code</button>
-  </div>
-</form>
-<form method="POST">
-  <input type="hidden" name="token" value="${esc(token)}">
-  <input type="hidden" name="action" value="deny">
-  <div class="actions"><button type="submit" class="deny">❌ Deny</button></div>
-</form>
-${dashLink}
-</body></html>`);
+  res.json({
+    id,
+    status: request.status,
+    skill_id: request.skill_id,
+    code_hash: request.code_hash,
+    created_at: request.created_at,
+    code,
+    metadata,
+    analysis,
+    scope_request: scopeReq ? {
+      session_id: scopeReq.sessionId,
+      description: scopeReq.description,
+      constraints: scopeReq.constraints,
+      structured_constraints: scopeReq.structuredConstraints,
+      secrets: scopeReq.secrets,
+      networks: scopeReq.networks,
+      missing_secrets: scopeReq.secrets.filter(s => !storedSecretNames.includes(s)),
+    } : undefined,
+    result: request.result ? JSON.parse(request.result) : undefined,
+    error: request.error,
+  });
 });
 
 // Process web approval
+// Process approval (JSON API)
 app.post('/approve/:id', async (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
-  const { token, action, level } = req.body;
+  const { token, action, level, secrets: providedSecrets } = req.body;
   const request = db.getRequest(id);
-  if (!request) return res.status(404).send('Not found');
-  if (!token || token !== request.approval_token) return res.status(403).send('Invalid token');
-  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const orchUrl = req.headers['x-orchestrator-url'] as string | undefined;
-  const orchTenant = req.headers['x-tenant-id'] as string | undefined;
-  const B = orchUrl && orchTenant ? `${orchUrl}/t/${orchTenant}` : '';
-  const dashboardUrl = `${B}/dashboard?token=${esc(API_BEARER_TOKEN)}`;
-  if (request.status !== 'pending') return res.redirect(`/approve/${id}?token=${token}`);
+  if (!request) return res.status(404).json({ error: 'Not found' });
+  if (!token || token !== request.approval_token) return res.status(403).json({ error: 'Invalid token' });
+  if (request.status !== 'pending') return res.json({ id, status: request.status, message: 'Already processed' });
 
   if (action === 'deny') {
     db.updateRequestStatus(id, 'denied');
@@ -835,27 +584,24 @@ app.post('/approve/:id', async (req: Request, res: Response) => {
       const reqMsg = request.telegram_message_id;
       if (reqMsg) await telegramBot.updateExecution(reqMsg, id, { success: false, error: 'Denied via web', duration: 0 });
     }
-    return res.type('html').send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<style>body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;padding:2em;text-align:center}</style>
-</head><body><h2>❌ Denied</h2><p>Request ${esc(id)} was denied.</p></body></html>`);
+    return res.json({ id, status: 'denied' });
   }
 
-  // Store any secrets provided with the approval form
-  for (const key of Object.keys(req.body)) {
-    if (key.startsWith('secret_') && req.body[key]) { const n = key.slice(7); secrets[n] = req.body[key]; db.setSecret(n, req.body[key]); }
+  // Store any secrets provided with the approval
+  if (providedSecrets && typeof providedSecrets === 'object') {
+    for (const [n, v] of Object.entries(providedSecrets)) {
+      if (v) { secrets[n] = v as string; db.setSecret(n, v as string); }
+    }
   }
 
   // Scope request approval — create or extend session with constraints
   const scopeReq = getScopeRequest(id);
   if (scopeReq) {
     const allConstraints = [...scopeReq.structuredConstraints];
-    // Convert legacy string constraints to natural_language
     for (const c of scopeReq.constraints) allConstraints.push({ type: 'natural_language', rule: c, rationale: '' });
 
     const existingSession = db.getSession(scopeReq.sessionId);
     if (existingSession) {
-      // Incremental scope: merge into existing session
       const p = existingSession.policy;
       p.allowedSecrets = [...new Set([...p.allowedSecrets, ...scopeReq.secrets])];
       p.allowedNetworks = [...new Set([...p.allowedNetworks, ...scopeReq.networks])];
@@ -879,23 +625,11 @@ app.post('/approve/:id', async (req: Request, res: Response) => {
       db.createSession(scopeReq.sessionId, policy);
     }
 
-    // Record the scope grant
     db.addScopeGrant(scopeReq.sessionId, scopeReq.description, allConstraints, scopeReq.secrets, scopeReq.networks);
-
     db.updateRequestStatus(id, 'completed');
     notifyStatusWaiters(id);
-    const totalConstraints = allConstraints.length;
-    console.log(`📋 Scope approved, session ${scopeReq.sessionId} ${existingSession ? 'expanded' : 'created'} with ${totalConstraints} constraints${scopeReq.codeHash ? `, code hash ${scopeReq.codeHash.substring(0, 16)}` : ''}`);
-
-    return res.type('html').send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<style>body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;padding:2em;text-align:center}
-a{color:#89b4fa}</style>
-</head><body><h2>✅ ${existingSession ? 'Scope Expanded' : 'Scope Approved'}</h2>
-<p>Session <code>${esc(scopeReq.sessionId)}</code> ${existingSession ? 'updated' : 'created'}.</p>
-<p>${totalConstraints} constraints active.</p>
-<p><a href="${dashboardUrl}">View Dashboard</a></p>
-</body></html>`);
+    console.log(`📋 Scope approved, session ${scopeReq.sessionId} ${existingSession ? 'expanded' : 'created'} with ${allConstraints.length} constraints`);
+    return res.json({ id, status: 'completed', session_id: scopeReq.sessionId, expanded: !!existingSession, constraints: allConstraints.length });
   }
 
   // Approve code execution
@@ -904,7 +638,6 @@ a{color:#89b4fa}</style>
     db.addApproval(request.skill_url, request.code_hash, 'forever');
   }
 
-  // Session handling
   const reqArgs = request.args ? JSON.parse(request.args) : {};
   const sessionId = reqArgs._sessionId;
   const analysisData = pendingAnalyses.get(id);
@@ -929,18 +662,11 @@ a{color:#89b4fa}</style>
   const requiredSecrets = JSON.parse(request.secrets);
   executeInBackground(id, code, metadata!, requiredSecrets);
 
-  res.type('html').send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<style>body{font-family:monospace;background:#1e1e2e;color:#cdd6f4;padding:2em;text-align:center}
-a{color:#89b4fa}</style>
-</head><body><h2>✅ Approved</h2><p>Executing ${esc(request.skill_id)}...</p>
-<p><a href="/approve/${esc(id)}?token=${esc(token)}">View status</a></p>
-<script>setTimeout(()=>location.reload(),3000)</script>
-</body></html>`);
+  res.json({ id, status: 'approved', executing: true });
 });
 
 // Request scope (creates session with constraints, pending human approval)
-app.post('/scope', requireAuth, async (req: Request, res: Response) => {
+app.post('/scope', requireTenant, syncTenant, async (req: Request, res: Response) => {
   try {
     const { session_id: clientSessionId, description, constraints, secrets: requestedSecrets, networks, skill_code } = req.body;
     if (!description) return res.status(400).json({ error: 'Missing description' });
@@ -983,7 +709,7 @@ app.post('/scope', requireAuth, async (req: Request, res: Response) => {
 });
 
 // Request execution (supports dry_run: true to check without executing)
-app.post('/execute', requireAuth, async (req: Request, res: Response) => {
+app.post('/execute', requireTenant, syncTenant, async (req: Request, res: Response) => {
   try {
     const { skill_id, skill_url, skill_code, secrets: requiredSecrets, args, session_id: clientSessionId, dry_run } = req.body;
     if (!skill_id) return res.status(400).json({ error: 'Missing skill_id' });
@@ -1033,7 +759,7 @@ app.post('/execute', requireAuth, async (req: Request, res: Response) => {
     // Check session policy (structured constraints don't need analysis)
     let policyViolations: string[] | undefined;
     const session = db.getSession(sessionId);
-    if (session && (analysis || session.policy.structuredConstraints?.length)) {
+    if (session) {
       const sc = session.policy.structuredConstraints?.length || 0;
       console.log(`📋 Checking session ${sessionId}: secrets=${JSON.stringify(session.policy.allowedSecrets)} networks=${JSON.stringify(session.policy.allowedNetworks)} constraints=${session.policy.constraints?.length || 0} structured=${sc}`);
       if (analysis) console.log(`   Analysis: secrets=${JSON.stringify(analysis.secretsUsed)} networks=${JSON.stringify(analysis.networkTargets)} risk=${analysis.riskLevel}`);
@@ -1130,7 +856,7 @@ function buildStatusResponse(request: any): any {
 }
 
 // Get execution status — supports ?wait=true for long-poll (up to 120s)
-app.get('/execute/:id/status', requireAuth, async (req: Request, res: Response) => {
+app.get('/execute/:id/status', requireTenant, syncTenant, async (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const request = db.getRequest(id);
   if (!request) return res.status(404).json({ error: 'Request not found' });

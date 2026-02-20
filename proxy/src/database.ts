@@ -4,6 +4,7 @@
 
 import Database from 'better-sqlite3';
 import { createHash } from 'crypto';
+import * as pgLog from './postgres.js';
 
 export interface ExecutionRecord {
   id: string;
@@ -32,6 +33,7 @@ export interface ApprovalRecord {
 
 export class ProxyDatabase {
   private db: Database.Database;
+  tenantId = 'default';
 
   constructor(dbPath: string) {
     this.db = new Database(dbPath);
@@ -138,6 +140,7 @@ export class ProxyDatabase {
       Date.now(),
       approvalToken || null
     );
+    pgLog.logExecution(id, this.tenantId, skillId, skillUrl, codeHash);
   }
 
   getRequest(id: string): ExecutionRecord | undefined {
@@ -166,6 +169,7 @@ export class ProxyDatabase {
     this.db.prepare(`
       UPDATE execution_requests SET ${updates.join(', ')} WHERE id = ?
     `).run(...params);
+    pgLog.updateExecutionStatus(id, status);
   }
 
   updateRequestResult(id: string, result: any, error?: string): void {
@@ -179,6 +183,7 @@ export class ProxyDatabase {
       error || null,
       id
     );
+    pgLog.updateExecutionResult(id, error ? 'failed' : 'completed', error);
   }
 
   // Skill Approvals
@@ -303,6 +308,7 @@ export class ProxyDatabase {
     this.db.prepare(
       'INSERT OR REPLACE INTO sessions (session_id, created_at, last_activity, policy) VALUES (?, ?, ?, ?)'
     ).run(sessionId, now, now, JSON.stringify(policy));
+    pgLog.logSession(sessionId, this.tenantId, policy.description);
   }
 
   getSession(sessionId: string): { session_id: string; created_at: number; last_activity: number; policy: SessionPolicy } | undefined {
@@ -318,6 +324,7 @@ export class ProxyDatabase {
 
   touchSession(sessionId: string): void {
     this.db.prepare('UPDATE sessions SET last_activity = ? WHERE session_id = ?').run(Date.now(), sessionId);
+    pgLog.touchSession(sessionId);
   }
 
   updateSessionPolicy(sessionId: string, policy: SessionPolicy): void {
@@ -343,6 +350,7 @@ export class ProxyDatabase {
     this.db.prepare(
       'INSERT INTO scope_grants (session_id, description, constraints, secrets, networks, approved_at) VALUES (?, ?, ?, ?, ?, ?)'
     ).run(sessionId, description || null, JSON.stringify(constraints), JSON.stringify(scopeSecrets), JSON.stringify(networks), Date.now());
+    pgLog.logScopeGrant(sessionId, this.tenantId, description, constraints, networks);
   }
 
   getScopeGrants(sessionId: string): Array<{ id: number; description: string | null; constraints: PolicyConstraint[]; secrets: string[]; networks: string[]; approved_at: number }> {
