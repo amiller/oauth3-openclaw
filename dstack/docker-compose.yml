@@ -1,10 +1,10 @@
-# OAuth3 Enclave — dstack CVM deployment with attested TLS via Cloudflare
-# Deploy: dstack compose up -d
-# Requires .env with CLOUDFLARE_API_TOKEN
+# OAuth3 Enclave — Phala CVM deployment with attested TLS via Cloudflare
+# Deploy: phala deploy --cvm-id <ID> -c docker-compose.yml -e .env
+# Requires .env with CLOUDFLARE_API_TOKEN, JWT_SECRET, PG_PASSWORD
 
 services:
   dstack-ingress:
-    image: kvin/dstack-ingress@sha256:0f4b1fdd7e077c4a25d3bb3a0837e04d0a18f45e2018af0be1124bceee167880
+    image: dstacktee/dstack-ingress:20250929@sha256:2b47b3e538df0b3e7724255b89369194c8c83a7cfba64d2faf0115ad0a586458
     ports:
       - "443:443"
     environment:
@@ -17,11 +17,14 @@ services:
       TARGET_ENDPOINT: http://oauth3-proxy:3737
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
+      - /var/run/tappd.sock:/var/run/tappd.sock
       - cert-data:/etc/letsencrypt
     restart: unless-stopped
 
   oauth3-proxy:
-    build: ../proxy
+    image: ghcr.io/amiller/oauth3-proxy@sha256:560783c849c88727a184a32d2b8cbffd497f2720adbcec7f1127f96dce258a6f
+    ports:
+      - "3737:3737"
     environment:
       PORT: "3737"
       DB_PATH: /data/proxy.db
@@ -29,10 +32,22 @@ services:
       DATABASE_URL: postgres://${PG_USER:-oauth3}:${PG_PASSWORD}@postgres:5432/${PG_DB:-oauth3}
       CORS_ORIGIN: ${CORS_ORIGIN}
       JWT_SECRET: ${JWT_SECRET:-}
+      PUBLIC_URL: https://${DOMAIN}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     volumes:
       - oauth3-data:/data
+    restart: unless-stopped
+
+  ssh:
+    image: ghcr.io/amiller/dstack-ssh-sidecar@sha256:619756189423e1ad1452a5606adf57ef72ac5812fcd31933fdd156e53848ab53
+    privileged: true
+    network_mode: host
+    environment:
+      SSH_PUBKEY: ${SSH_PUBKEY:-}
+    volumes:
+      - /:/host/
+      - /var/run/dstack.sock:/var/run/dstack.sock
     restart: unless-stopped
 
   postgres:

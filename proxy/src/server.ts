@@ -466,6 +466,14 @@ app.get('/secrets', requireTenant, syncTenant, (req: Request, res: Response) => 
   res.json({ secrets: Object.keys(secrets) });
 });
 
+app.delete('/secrets/:name', requireTenant, syncTenant, (req: Request, res: Response) => {
+  const name = typeof req.params.name === 'string' ? req.params.name : req.params.name[0];
+  if (!secrets[name]) return res.status(404).json({ error: 'Secret not found' });
+  delete secrets[name];
+  db.deleteSecret(name);
+  res.json({ success: true, deleted: name });
+});
+
 // Auth: JWT (from orchestrator or standalone) with legacy bearer token fallback
 // Imported from ./auth.ts as requireTenant middleware
 
