@@ -47,7 +47,18 @@ const DB_PATH = process.env.DB_PATH || './proxy.db';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const PUBLIC_URL = process.env.PUBLIC_URL || '';
+const ORCHESTRATOR_URL = (process.env.ORCHESTRATOR_URL || '').replace(/\/+$/, '');
 const API_BEARER_TOKEN = process.env.API_BEARER_TOKEN || '';
+
+function buildApprovalUrl(requestId: string, approvalToken: string, req: any): string | undefined {
+  // Priority: X-Orchestrator-URL header > ORCHESTRATOR_URL env > PUBLIC_URL env
+  const orchHeader = req.headers['x-orchestrator-url'] as string | undefined;
+  const orchTenant = req.headers['x-tenant-id'] as string | undefined;
+  if (orchHeader && orchTenant) return `${orchHeader}/t/${orchTenant}/approve/${requestId}?token=${approvalToken}`;
+  if (ORCHESTRATOR_URL) return `${ORCHESTRATOR_URL}/approve/${requestId}?token=${approvalToken}&tee=${PUBLIC_URL}`;
+  if (PUBLIC_URL) return `${PUBLIC_URL}/approve/${requestId}?token=${approvalToken}`;
+  return undefined;
+}
 
 // Initialize database
 const db = new ProxyDatabase(DB_PATH);
@@ -695,13 +706,9 @@ app.post('/scope', requireTenant, syncTenant, async (req: Request, res: Response
     db.createRequest(requestId, 'scope-request', 'scope', hashCode(scopeData), secretsList, { sessionId, description, constraints: constraintsList, networks: networksList }, approvalToken);
     db.storeCode(requestId, scopeData);
 
-    const orchUrl = req.headers['x-orchestrator-url'] as string | undefined;
-    const orchTenant = req.headers['x-tenant-id'] as string | undefined;
-    const urlBase = orchUrl && orchTenant ? `${orchUrl}/t/${orchTenant}` : PUBLIC_URL;
-    const approvalUrl = urlBase ? `${urlBase}/approve/${requestId}?token=${approvalToken}` : undefined;
-    const statusUrl = urlBase ? `${urlBase}/execute/${requestId}/status?wait=true` : undefined;
-    const dashboardUrl = urlBase ? `${urlBase}/dashboard?token=${API_BEARER_TOKEN}` : undefined;
-    res.json({ request_id: requestId, status: 'pending_scope', session_id: sessionId, approval_url: approvalUrl, status_url: statusUrl, dashboard_url: dashboardUrl, message: 'Scope request awaiting approval — poll status_url to be notified when approved' });
+    const approvalUrl = buildApprovalUrl(requestId, approvalToken, req);
+    const statusUrl = PUBLIC_URL ? `${PUBLIC_URL}/execute/${requestId}/status?wait=true` : undefined;
+    res.json({ request_id: requestId, status: 'pending_scope', session_id: sessionId, approval_url: approvalUrl, status_url: statusUrl, message: 'Scope request awaiting approval — poll status_url to be notified when approved' });
   } catch (error: any) {
     console.error('Scope request error:', error);
     res.status(500).json({ error: error.message });
@@ -810,17 +817,14 @@ app.post('/execute', requireTenant, syncTenant, async (req: Request, res: Respon
     db.storeCode(requestId, code);
     if (analysis) pendingAnalyses.set(requestId, analysis);
 
-    const orchUrl = req.headers['x-orchestrator-url'] as string | undefined;
-    const orchTenant = req.headers['x-tenant-id'] as string | undefined;
-    const urlBase = orchUrl && orchTenant ? `${orchUrl}/t/${orchTenant}` : PUBLIC_URL;
-    const approvalUrl = urlBase ? `${urlBase}/approve/${requestId}?token=${approvalToken}` : undefined;
+    const approvalUrl = buildApprovalUrl(requestId, approvalToken, req);
 
     if (telegramBot && approvalUrl) {
       const messageId = await telegramBot.sendApprovalLink(requestId, skill_id, metadata, approvalUrl, analysis?.summary);
       db.updateRequestStatus(requestId, 'pending', messageId);
     }
 
-    const statusUrl = urlBase ? `${urlBase}/execute/${requestId}/status?wait=true` : undefined;
+    const statusUrl = PUBLIC_URL ? `${PUBLIC_URL}/execute/${requestId}/status?wait=true` : undefined;
     const response: any = { request_id: requestId, status: 'pending', session_id: sessionId, approval_url: approvalUrl, status_url: statusUrl, message: 'Awaiting approval — poll status_url to be notified when approved' };
     if (policyViolations?.length) response.policy_violations = policyViolations;
     res.json(response);
