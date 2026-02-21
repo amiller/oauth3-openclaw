@@ -8,6 +8,7 @@ import { ProxyDatabase, SessionPolicy } from './database.js';
 import { executeSkill, hashCode, parseMetadata, EXECUTOR_MODE } from './executor.js';
 import { analyzeCode, CodeAnalysis, reviewCode, CodeReview, reviewInvocation, checkPolicyCompliance, reviewArgs, tokenUsage } from './analyzer.js';
 import { PolicyConstraint, enforceStrict, enforceSoft, isStructuredConstraint, splitConstraints } from './policy.js';
+import { analyzeStatic, verifyAgainstScope, StaticAnalysis, VerificationResult } from './ast-analyzer.js';
 import { requireTenant, handleSignup, TenantContext } from './auth.js';
 import * as pgLog from './postgres.js';
 import { randomBytes } from 'crypto';
@@ -21,6 +22,7 @@ app.use((_req, res, next) => { res.setHeader('Referrer-Policy', 'no-referrer'); 
 const CORS_ORIGIN = process.env.CORS_ORIGIN || 'https://oauth3.app';
 app.use((req, res, next) => {
   const origin = req.headers.origin;
+  if (req.url.includes('/approve/')) console.log('[CORS debug]', { origin, referer: req.headers.referer, ua: req.headers['user-agent']?.slice(0, 80), method: req.method });
   if (origin && (CORS_ORIGIN === '*' || CORS_ORIGIN.split(',').includes(origin))) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
@@ -275,72 +277,89 @@ if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
 app.get('/', (req: Request, res: Response) => {
   res.type('text/markdown').send(`# OAuth3 Execution Proxy
 
-Programmable API gateway running in a TEE (Trusted Execution Environment).
-Submit code that runs in a Deno sandbox with access to secrets you don't hold directly.
-Human approval gates execution — or session policies auto-approve within learned bounds.
+TEE-sandboxed code execution with human-approved permits.
+Your code runs in a Deno sandbox with access to secrets you don't hold directly.
 
-## Quick Start
+## How It Works
 
-1. **Submit code** via \`POST /execute\`
-2. If status is \`pending\`, share the \`approval_url\` with the user (use markdown link formatting)
-3. **IMMEDIATELY long-poll** \`GET /execute/:id/status?wait=true\` (with your bearer token) — this blocks up to 120s and returns when the request is approved+executed or denied. You MUST call this right after submitting. Do NOT wait for the user to tell you it was approved.
-4. If the long-poll times out (120s), re-poll. Loop until you get a terminal status.
-5. Result arrives in \`result.stdout\`
+1. **Request a permit** — describe what you need (secrets, networks, constraints). No code yet.
+2. **Human approves the permit** — they see a short plan, not your code.
+3. **Submit actions** under the permit — code + args, verified programmatically.
+4. **System enforces** — AST static analysis, constraint checks, Deno sandbox.
+
+The human reviews a 4-5 line permit request. The system verifies your code deterministically.
+Friction scales with risk: simple gateway-pattern actions auto-approve; unusual code gets more scrutiny.
+
+## Trust Model
+
+\`\`\`
+You (agent)              TEE                          Human
+  │                       │                             │
+  ├─ permit request ─────►│                             │
+  │  (description,        │── reviews plan ────────────►│ sees permit + interpretation
+  │   constraints,        │   (NO code, just the        │ (short, fully readable)
+  │   secrets, networks)  │    structured permit)        │
+  │                       │◄── approves permit ─────────┤
+  │                       │                             │
+  ├─ action (code+args) ─►│                             │
+  │                       │── AST static analysis       │
+  │                       │   (fetch URLs, env vars)    │
+  │                       │── constraint check          │
+  │                       │   (regex/predicate on args) │
+  │                       │── Deno sandbox enforces     │
+  │                       │   --allow-net, --allow-env  │
+  │                       │                             │
+  │◄─ result + report ───┤──────────────────────────►│ sees enforcement report
+\`\`\`
+
+**Key:** No LLM ever reads your code. Verification is regex-based AST analysis.
+The human can verify the permit (it's short) and the enforcement report (a checklist).
+
+## Authentication
+
+\`\`\`
+POST /signup  {"name": "my-agent"}
+→ { "tenant_id": "...", "token": "..." }
+\`\`\`
+
+Use on all requests: \`Authorization: Bearer <token>\`
+
+## Quick Start (Recommended: Permit → Action)
+
+1. \`POST /signup\` to get a token
+2. \`POST /scope\` to request a **permit** (what secrets/networks/constraints you need)
+3. Share the \`approval_url\` with the user — they approve the permit
+4. \`POST /execute\` to submit **actions** under that permit (auto-approved if constraints pass)
+5. **IMMEDIATELY long-poll** \`GET /execute/:id/status?wait=true\` — blocks up to 120s
+
+\`\`\`
+POST /scope   → { status: "pending_scope", approval_url, session_id }
+# Human approves the permit at approval_url
+POST /execute → { status: "approved", request_id }  (auto-approved!)
+GET  /execute/:id/status?wait=true → { status: "completed", result: {...} }
+\`\`\`
+
+You can also skip the permit and go straight to \`POST /execute\` — but then the
+human reviews each action individually, which is slower for both of you.
 
 ## ⚠️ Critical: Always Long-Poll
 
-Every response includes a \`status_url\`. You MUST fetch it immediately after receiving a \`pending\` or \`pending_scope\` status. Example flow:
-
-\`\`\`
-POST /execute -> { status: "pending", status_url: "...status?wait=true", approval_url: "..." }
-# Show approval_url to user, AND SIMULTANEOUSLY:
-GET /execute/:id/status?wait=true -> blocks until approved+executed -> { status: "completed", result: {...} }
-\`\`\`
-
-Do NOT treat pending as "done, wait for user to tell me." Treat it as "show the link, then immediately block on status_url."
+Every response includes a \`status_url\`. You MUST fetch it immediately after receiving
+a \`pending\` or \`pending_scope\` status. Do NOT wait for the user to tell you it was approved.
+Show the link AND simultaneously block on status_url.
 
 ## Endpoints
 
-### POST /execute
-Submit code for sandboxed execution.
+### POST /scope — Request a Permit
+
+Describe what you need. The human approves the boundary, not each action.
 
 \`\`\`json
 {
-  "skill_id": "my-task",
-  "skill_code": "// @skill my-task\\n// @description Fetch something\\n// @secrets API_KEY\\n// @network api.example.com\\n// @timeout 30\\nconst r = await fetch('https://api.example.com', {headers: {Authorization: Deno.env.get('API_KEY')!}});\\nconsole.log(await r.text());",
-  "secrets": ["API_KEY"],
-  "args": {"key": "value"},
-  "session_id": "optional-reuse-for-auto-approve"
-}
-\`\`\`
-
-Response: \`{ request_id, status, session_id, approval_url }\`
-
-- \`status: "approved"\` — already executing (trusted code or session auto-approve)
-- \`status: "pending"\` — needs human approval at \`approval_url\`
-
-### GET /execute/:id/status?wait=true
-Long-polls up to 120s. Returns when status reaches a terminal state.
-
-Response: \`{ request_id, status, result, error }\`
-- \`result.stdout\` — your program's stdout (this is the output channel)
-- \`result.stderr\` — stderr
-- \`result.exitCode\` — 0 on success
-- \`result.duration\` — ms
-
-### POST /scope — request a scope (session with constraints)
-
-Constraints can be **typed** (preferred) or plain strings (legacy). Typed constraints enable
-deterministic enforcement — regex and predicate constraints are checked instantly with zero LLM cost.
-Only \`natural_language\` constraints require a runtime Haiku call.
-
-\`\`\`json
-{
-  "description": "GitHub access for amiller repos",
+  "description": "File issues on amiller/oauth3-proxy",
   "constraints": [
     { "type": "regex", "param": "repo", "pattern": "^amiller/.*$", "rationale": "Only amiller repos" },
-    { "type": "predicate", "param": "action", "op": "in", "value": ["list", "create"], "rationale": "Read + create only" },
-    { "type": "natural_language", "rule": "Skip issues labeled keep-open", "rationale": "Respect manual overrides" }
+    { "type": "predicate", "param": "method", "op": "in", "value": ["GET", "POST"], "rationale": "Read + create only" }
   ],
   "secrets": ["GH_TOKEN"],
   "networks": ["api.github.com"],
@@ -348,110 +367,122 @@ Only \`natural_language\` constraints require a runtime Haiku call.
 }
 \`\`\`
 
-**Constraint types:**
-- \`regex\` — \`param\` value must match \`pattern\`. Deterministic, instant.
-- \`predicate\` — operators: \`>=\`, \`<=\`, \`==\`, \`!=\`, \`in\`, \`prefix\`, \`suffix\`. Deterministic, instant.
-- \`natural_language\` — free-text rule, checked by isolated Haiku reviewer at runtime. Costs ~$0.001/call.
+**Constraint types (prefer deterministic):**
+- \`regex\` — \`param\` must match \`pattern\`. Instant, zero cost. **Use this.**
+- \`predicate\` — operators: \`>=\`, \`<=\`, \`==\`, \`!=\`, \`in\`, \`prefix\`, \`suffix\`. Instant.
+- \`natural_language\` — free-text rule, checked by Haiku at runtime. ~$0.001/call.
 
-Plain string constraints still work (treated as \`natural_language\`).
+**Incremental permits:** Call \`POST /scope\` again with the same \`session_id\` to add capabilities.
+The human sees only the delta.
 
-**Prefer \`regex\`/\`predicate\`** — they're faster, cheaper, and the human can verify the exact rule.
+### POST /execute — Submit an Action
 
-**Incremental scopes:** Call \`POST /scope\` again with the same \`session_id\` to add capabilities.
-The human sees the delta. Session accumulates approved policies. Secrets/networks can only be added.
+\`\`\`json
+{
+  "skill_id": "create-issue",
+  "skill_code": "// @skill create-issue\\n// @description Create GitHub issue\\n// @secrets GH_TOKEN\\n// @network api.github.com\\n// @timeout 30\\nconst r = await fetch('https://api.github.com/repos/' + args.repo + '/issues', {method:'POST', headers:{Authorization:'token '+Deno.env.get('GH_TOKEN')!,'Content-Type':'application/json'}, body:JSON.stringify({title:args.title})});\\nconsole.log(await r.text());",
+  "args": {"repo": "amiller/oauth3-proxy", "title": "Test issue", "method": "POST"},
+  "session_id": "from-permit-above"
+}
+\`\`\`
 
-Returns \`{ request_id, status: "pending_scope", session_id, approval_url }\`.
-Human approves the scope at the URL. Once approved, a session is created with
-those constraints. Subsequent \`/execute\` calls with the same \`session_id\` are
-auto-approved if they pass constraint checks.
+**What happens when you submit an action:**
+1. **AST static analysis** — regex extraction of fetch URLs, env vars, imports. No LLM.
+2. **Verify against permit** — are all fetch hosts in \`networks\`? All env vars in \`secrets\`? No eval?
+3. **Constraint check** — do args satisfy the regex/predicate rules?
+4. **If all pass** → execute in Deno sandbox with \`--allow-net=HOSTS --allow-env=VARS\`
+5. **If AST fails** → denied with 403 and \`ast_verification_failed\` reason
+
+Response includes \`result.enforcement\` with the full verification checklist.
+
+### GET /execute/:id/status?wait=true — Poll for Result
+
+Long-polls up to 120s. Returns on terminal status.
+
+\`\`\`json
+{
+  "status": "completed",
+  "result": {
+    "stdout": "...", "stderr": "...", "exitCode": 0, "duration": 230,
+    "enforcement": {
+      "static_analysis": { "fetchUrls": [...], "envVars": [...], "hasEval": false },
+      "verification": { "checks": [{ "name": "fetch_urls", "passed": true, ... }], "allPassed": true },
+      "sandbox": { "allowNet": ["api.github.com"], "allowEnv": ["GH_TOKEN", "repo", "title"] },
+      "runtime": { "exitCode": 0, "duration": 230 }
+    }
+  }
+}
+\`\`\`
 
 ### POST /execute with dry_run
-Same body as above, add \`"dry_run": true\`. Returns what *would* happen without creating a request:
-\`\`\`json
-{ "dry_run": true, "would_auto_approve": true, "reason": "session_policy", "session_id": "...", "analysis": {...} }
-{ "dry_run": true, "would_auto_approve": false, "reason": "needs_approval", "policy_gaps": { "new_secrets": [...], "new_networks": [...] } }
-\`\`\`
-Use this to check if you already have sufficient approval before submitting.
+Add \`"dry_run": true\` to check if your action would auto-approve without submitting.
 
-### GET /sessions — list active sessions with policies
-### GET /sessions/:id — single session detail
-### DELETE /sessions/:id — revoke a session
-### POST /secrets — \`{ name, value }\`
-### GET /secrets — list secret names (not values)
-### GET /health — status check
+### Other Endpoints
+- \`GET /sessions\` — list active permits
+- \`GET /sessions/:id\` — permit detail
+- \`DELETE /sessions/:id\` — revoke a permit
+- \`POST /secrets\` — \`{ name, value }\`
+- \`GET /secrets\` — list secret names (not values)
+- \`GET /health\` — status check
 
 ## Code Format
 
-Code must have metadata comments:
 \`\`\`typescript
 // @skill name-of-task
 // @description What this does
-// @secrets SECRET_NAME (one per line, each secret you need)
-// @network hostname.com (one per line, each host you'll access)
-// @timeout 30 (seconds, default 30)
+// @secrets SECRET_NAME (one per line)
+// @network hostname.com (one per line)
+// @timeout 30
 
-// Your Deno/TypeScript code here
-// Secrets available via Deno.env.get("SECRET_NAME")
-// Args available via Deno.env.get("ARG_KEY")
-// All output goes to stdout — use console.log() or Deno.stdout
+// Deno/TypeScript — secrets via Deno.env.get("NAME"), args via args.key
+// Output via console.log() (stdout is the return channel)
 \`\`\`
 
-## Output Convention
+## Writing Good Actions (for smooth auto-approval)
 
-stdout is the output channel. For structured data, print JSON:
+**Gateway pattern (recommended):** Write short, parameterized code where the only
+varying inputs are structured args. The code is a thin wrapper around one API.
+
 \`\`\`typescript
-console.log(JSON.stringify({ files: [...], data: {...} }));
+// @skill github-api
+// @secrets GH_TOKEN
+// @network api.github.com
+const r = await fetch('https://api.github.com' + args.path, {
+  method: args.method || 'GET',
+  headers: { Authorization: 'token ' + Deno.env.get('GH_TOKEN')!, 'Content-Type': 'application/json' },
+  body: args.body ? JSON.stringify(args.body) : undefined,
+});
+console.log(await r.text());
 \`\`\`
-For binary data, base64-encode it:
-\`\`\`typescript
-import { encode } from "https://deno.land/std/encoding/base64.ts";
-console.log(JSON.stringify({ filename: "out.zip", data: encode(bytes) }));
-\`\`\`
-Max output: ~1MB. stderr is captured separately for diagnostics.
 
-## Sessions & Auto-Approval
+This pattern works well because:
+- AST sees a single literal fetch host → ✅ matches permit network
+- Args control what happens → constraints verify each invocation
+- Code is stable (same hash) → verification is cached
 
-Pass \`session_id\` to group related requests. Two ways to create a session:
+**What makes actions harder to auto-approve:**
+- Dynamic fetch URLs with \`\${}\` template literals → AST warns, sandbox still enforces
+- \`eval()\` or \`new Function()\` → AST blocks (always denied)
+- Fetching hosts not in your permit → AST blocks with \`ast_verification_failed\`
+- Accessing env vars not declared in permit → AST blocks
 
-1. **Implicit** — first manual approval creates a session policy from Haiku analysis
-2. **Explicit** — \`POST /scope\` to request a session with specific constraints upfront
-
-Subsequent requests that fit within the policy auto-approve. Sessions expire after 2h of inactivity.
-
-### Three-layer review for constrained sessions:
-1. **Structural analysis** (cached by code hash) — extracts secrets, networks, risk level
-2. **Code review** (cached by code hash) — verifies code is faithful to its description,
-   identifies what's parameterized (from args) vs hardcoded in source
-3. **Invocation review** (per-call, NOT cached) — checks actual arg values against constraints.
-   Does NOT re-read the code — just the review summary + args. Fast.
-
-### Writing good skills for auto-approval:
-- Write **generic, parameterized** skills — take repo/path/etc as args, not hardcoded
-- The code review verifies the code only accesses what its args specify
-- The invocation review checks each call's arg values against the scope constraints
-- Example: a \`create-issue\` skill that takes \`repo\` as arg. Code review confirms it only
-  hits \`/repos/{repo}/issues\`. Invocation review checks \`repo=owockibot/bounty\` is within bounds.
-- Avoid embedding request bodies in skill code — pass them as args for stable code hashes
-
-Trusted code (approved with "Trust Code") auto-executes forever by code hash.
+Friction is proportional to risk. If your action is unusual, the system correctly
+requires more scrutiny. This is a feature.
 
 ## Presenting Links to Users
 
-When sharing URLs with users (e.g. via Telegram), use markdown link formatting:
-\`[Approve: task-name](https://long-url...)\` instead of raw URLs.
-The approval_url and dashboard are long — always wrap them in descriptive link text.
+Use markdown: \`[Approve: task-name](https://long-url...)\` instead of raw URLs.
 
 ## Available Secrets
 ${Object.keys(secrets).map(s => '- ' + s).join('\n') || '(none configured)'}
 
 ---
 Public URL: ${PUBLIC_URL || '(not configured)'}
-Executor: ${EXECUTOR_MODE} mode
 `);
 });
 
 // Health check
-app.get('/health', (_req: Request, res: Response) => res.json({ status: 'ok', executor: EXECUTOR_MODE }));
+app.get('/health', (_req: Request, res: Response) => res.json({ status: 'ok' }));
 
 // Standalone signup (only available when no JWT_SECRET configured)
 app.post('/signup', handleSignup);
@@ -753,6 +784,10 @@ app.post('/execute', requireTenant, syncTenant, async (req: Request, res: Respon
       return res.json({ request_id: requestId, status: 'approved', message: 'Auto-approved (trusted code)' });
     }
 
+    // AST static analysis (always runs, no LLM needed)
+    const astAnalysis = analyzeStatic(code);
+    const argKeys = args ? Object.keys(args).filter(k => !k.startsWith('_')) : [];
+
     // Run structured analysis (needed for session policy check)
     let analysis: CodeAnalysis | undefined;
     if (process.env.ANTHROPIC_API_KEY) {
@@ -780,8 +815,23 @@ app.post('/execute', requireTenant, syncTenant, async (req: Request, res: Respon
         db.createRequest(requestId, skill_id, skill_url || 'inline', codeHash, secretsList, args, approvalToken);
         db.storeCode(requestId, code);
         db.touchSession(sessionId);
+
+        // AST verification against session policy
+        const scopeForVerify = { secrets: session.policy.allowedSecrets, networks: session.policy.allowedNetworks, argKeys };
+        const verification = verifyAgainstScope(astAnalysis, scopeForVerify);
+        const enforcement = { static_analysis: astAnalysis, verification };
+
+        if (!verification.allPassed) {
+          const failures = verification.checks.filter(c => !c.passed).map(c => `${c.name}: ${c.details || c.actual}`);
+          console.log(`🚫 AST verification failed for ${skill_id}:`, failures);
+          db.updateRequestResult(requestId, { success: false, enforcement }, `AST verification failed: ${failures.join('; ')}`);
+          return res.status(403).json({ request_id: requestId, status: 'denied', reason: 'ast_verification_failed', failures, enforcement });
+        }
+
         db.updateRequestStatus(requestId, 'approved');
-        executeInBackground(requestId, code, metadata, secretsList);
+        // Use session policy networks for sandbox (not code metadata)
+        const enforcedMetadata = { ...metadata, network: session.policy.allowedNetworks };
+        executeInBackground(requestId, code, enforcedMetadata, secretsList, enforcement);
         return res.json({ request_id: requestId, status: 'approved', session_id: sessionId, message: 'Auto-approved (session policy)' });
       }
       if (violations?.length) {
@@ -860,7 +910,21 @@ function buildStatusResponse(request: any): any {
 }
 
 // Get execution status — supports ?wait=true for long-poll (up to 120s)
-app.get('/execute/:id/status', requireTenant, syncTenant, async (req: Request, res: Response) => {
+// Auth: Bearer token OR ?token=APPROVAL_TOKEN (for report pages)
+app.get('/execute/:id/status', async (req: Request, res: Response, next: () => void) => {
+  const token = req.query.token as string;
+  if (token) {
+    const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
+    const request = db.getRequest(id);
+    if (request && request.approval_token === token) {
+      (req as any)._tokenAuthed = true;
+      return handleStatus(req, res);
+    }
+  }
+  requireTenant(req, res, () => syncTenant(req, res, () => handleStatus(req, res)));
+});
+
+async function handleStatus(req: Request, res: Response) {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const request = db.getRequest(id);
   if (!request) return res.status(404).json({ error: 'Request not found' });
@@ -882,10 +946,10 @@ app.get('/execute/:id/status', requireTenant, syncTenant, async (req: Request, r
   }
 
   res.json(buildStatusResponse(request));
-});
+}
 
-// Helper: Execute skill in background
-async function executeInBackground(requestId: string, code: string, metadata: any, requiredSecrets: string[]) {
+// Helper: Execute skill in background (with optional enforcement data)
+async function executeInBackground(requestId: string, code: string, metadata: any, requiredSecrets: string[], enforcement?: any) {
   console.log(`\n🚀 Starting background execution for ${requestId}`);
   try {
     db.updateRequestStatus(requestId, 'executing');
@@ -906,17 +970,26 @@ async function executeInBackground(requestId: string, code: string, metadata: an
       return;
     }
 
+    const allowedNetworks = metadata.network || [];
     const result = await executeSkill({
       code, secrets: secretValues, args,
       timeout: metadata.timeout || 30,
-      allowedNetworks: metadata.network || []
+      allowedNetworks,
     });
     console.log(`  Execution complete:`, result.success ? '✅' : '❌');
 
-    db.updateRequestResult(requestId, {
+    const resultData: any = {
       success: result.success, stdout: result.stdout,
-      stderr: result.stderr, exitCode: result.exitCode, duration: result.duration
-    }, result.success ? undefined : result.stderr);
+      stderr: result.stderr, exitCode: result.exitCode, duration: result.duration,
+    };
+    if (enforcement) {
+      resultData.enforcement = {
+        ...enforcement,
+        sandbox: { allowNet: allowedNetworks, allowEnv: [...requiredSecrets, ...Object.keys(args).filter(k => !k.startsWith('_'))] },
+        runtime: { exitCode: result.exitCode, duration: result.duration },
+      };
+    }
+    db.updateRequestResult(requestId, resultData, result.success ? undefined : result.stderr);
     notifyStatusWaiters(requestId);
 
     const request = db.getRequest(requestId);
@@ -939,6 +1012,11 @@ async function executeInBackground(requestId: string, code: string, metadata: an
     } catch {}
   }
 }
+
+// JSON 404 for unmatched routes (never return HTML to agents)
+app.use((_req: Request, res: Response) => {
+  res.status(404).json({ error: 'Not found', hint: 'GET / for API documentation' });
+});
 
 setInterval(() => db.cleanupExpired(), 60 * 60 * 1000);
 

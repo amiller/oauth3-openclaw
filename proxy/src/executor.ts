@@ -97,10 +97,13 @@ function buildDenoPermArgs(request: ExecutionRequest): { denoArgs: string[], arg
   const networks = request.allowedNetworks || [];
   const denoArgs = ['run', '--no-prompt', '--quiet'];
 
-  // In direct mode the TEE is the sandbox — grant all permissions
+  // Direct mode: scoped permissions (TEE is outer sandbox, Deno is inner enforcement)
   if (EXECUTOR_MODE === 'direct') {
-    denoArgs.push('--allow-all');
-    return { denoArgs, argKeys: Object.keys(request.args || {}) };
+    if (networks.length > 0) denoArgs.push(`--allow-net=${networks.join(',')}`);
+    const argKeys = Object.keys(request.args || {});
+    const allowedEnvVars = [...Object.keys(request.secrets), ...argKeys];
+    if (allowedEnvVars.length > 0) denoArgs.push(`--allow-env=${allowedEnvVars.join(',')}`);
+    return { denoArgs, argKeys };
   }
 
   if (networks.length > 0) {
