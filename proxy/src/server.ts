@@ -781,7 +781,8 @@ app.post('/execute', requireTenant, syncTenant, async (req: Request, res: Respon
       console.log(`⚡ Auto-executing trusted code: ${codeHash.substring(0, 16)}...`);
       db.updateRequestStatus(requestId, 'approved');
       executeInBackground(requestId, code, metadata, secretsList);
-      return res.json({ request_id: requestId, status: 'approved', message: 'Auto-approved (trusted code)' });
+      const statusUrl = PUBLIC_URL ? `${PUBLIC_URL}/execute/${requestId}/status?wait=true` : undefined;
+      return res.json({ request_id: requestId, status: 'approved', status_url: statusUrl, message: 'Auto-approved (trusted code)' });
     }
 
     // AST static analysis (always runs, no LLM needed)
@@ -832,7 +833,8 @@ app.post('/execute', requireTenant, syncTenant, async (req: Request, res: Respon
         // Use session policy networks for sandbox (not code metadata)
         const enforcedMetadata = { ...metadata, network: session.policy.allowedNetworks };
         executeInBackground(requestId, code, enforcedMetadata, secretsList, enforcement);
-        return res.json({ request_id: requestId, status: 'approved', session_id: sessionId, message: 'Auto-approved (session policy)' });
+        const statusUrl = PUBLIC_URL ? `${PUBLIC_URL}/execute/${requestId}/status?wait=true` : undefined;
+        return res.json({ request_id: requestId, status: 'approved', session_id: sessionId, status_url: statusUrl, message: 'Auto-approved (session policy)' });
       }
       if (violations?.length) {
         console.log(`🚫 Policy violations for ${skill_id}:`, violations);

@@ -22,7 +22,7 @@ services:
     restart: unless-stopped
 
   oauth3-proxy:
-    image: ghcr.io/amiller/oauth3-proxy@sha256:83b1132815341d81c3b769e2efbe8cd21cc2df7696fafd9539a107ba1c198fee
+    image: ghcr.io/amiller/oauth3-proxy@sha256:90bf508de7a0ecafd37bc2b0bb0b104bd13ac0927c16acb5a5bfb431af1ebf7a
     ports:
       - "3737:3737"
     environment:
