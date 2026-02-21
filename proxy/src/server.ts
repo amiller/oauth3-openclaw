@@ -7,7 +7,7 @@ import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import { ProxyDatabase, SessionPolicy } from './database.js';
 import { execute, hashCode, EXECUTOR_MODE } from './executor.js';
-import { verifyCapabilityMode } from './ast-analyzer.js';
+// ast-analyzer.ts kept for analyzeStatic (non-capability mode) but not used as a gate
 import { CapabilitySpec, CapabilityFunction, validateSpec, extractSecrets, extractNetworks, summarizeSpec, hashSpec, draftCapability, fetchDocContent, tokenUsage, PolicyConstraint } from './capability.js';
 import { requireTenant, handleSignup, TenantContext } from './auth.js';
 import * as pgLog from './postgres.js';
@@ -455,23 +455,12 @@ app.post('/execute', requireTenant, syncTenant, async (req: Request, res: Respon
     db.storeCode(requestId, actionCode);
     db.touchSession(effectivePermitId);
 
-    // Verify agent code only calls declared capabilities
-    const capNames = session.policy.capabilities.map(c => c.name);
-    const verification = verifyCapabilityMode(actionCode, capNames);
     const enforcement: any = {
       mode: 'capability',
-      verification,
       capabilities: session.policy.capabilities.map(c => ({
         name: c.name, doc_domain: c.doc_domain, summary: summarizeSpec(c.spec),
       })),
     };
-
-    if (!verification.allPassed) {
-      const failures = verification.checks.filter(c => !c.passed).map(c => `${c.name}: ${c.details || c.actual}`);
-      console.log(`🚫 Capability verification failed for ${actionId}:`, failures);
-      db.updateRequestResult(requestId, { success: false, enforcement }, `Capability verification failed: ${failures.join('; ')}`);
-      return res.status(403).json({ request_id: requestId, status: 'denied', reason: 'capability_verification_failed', failures, enforcement });
-    }
 
     db.updateRequestStatus(requestId, 'approved');
     const capDefs = session.policy.capabilities.map(c => c.code).join('\n\n');

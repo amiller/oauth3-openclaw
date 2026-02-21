@@ -100,9 +100,9 @@ export function hashSpec(spec: CapabilitySpec): string {
 const DRAFT_SYSTEM = `You generate a single TypeScript async function from a capability spec and API documentation.
 
 The function MUST:
-1. Take named parameters matching the spec's params (typed appropriately)
+1. Use positional parameters (NOT a single object param). Each spec param becomes a separate function argument.
 2. Validate each param that has a constraint (regex test or predicate check), throw on failure
-3. Construct exactly one HTTP request to the spec endpoint, substituting path params
+3. Construct exactly one HTTP request to the spec endpoint, substituting path params directly with template literals — do NOT use encodeURIComponent on path segments that contain slashes (e.g. "owner/repo")
 4. Apply the auth header with the secret from Deno.env.get()
 5. If rpc_wrap is true, wrap params in a JSON-RPC envelope with the rpc_method
 6. Return the parsed response (json or text per spec)
