@@ -1,5 +1,5 @@
 /**
- * Database for execution requests and approvals
+ * Database for execution requests and permits
  */
 
 import Database from 'better-sqlite3';
@@ -8,27 +8,18 @@ import * as pgLog from './postgres.js';
 
 export interface ExecutionRecord {
   id: string;
-  skill_id: string;
-  skill_url: string;
+  action_id: string;
+  skill_url: string; // kept for backward compat reads, always 'inline' or 'scope' now
   code_hash: string;
-  secrets: string; // JSON array
-  args: string | null; // JSON object
+  secrets: string;
+  args: string | null;
   status: string;
   created_at: number;
   approved_at: number | null;
   executed_at: number | null;
-  result: string | null; // JSON
+  result: string | null;
   error: string | null;
-  telegram_message_id: number | null;
   approval_token: string | null;
-}
-
-export interface ApprovalRecord {
-  skill_url: string;
-  code_hash: string;
-  approval_level: string;
-  approved_at: number;
-  expires_at: number | null;
 }
 
 export class ProxyDatabase {
@@ -57,16 +48,8 @@ export class ProxyDatabase {
         executed_at INTEGER,
         result TEXT,
         error TEXT,
-        telegram_message_id INTEGER
-      );
-
-      CREATE TABLE IF NOT EXISTS skill_approvals (
-        skill_url TEXT NOT NULL,
-        code_hash TEXT NOT NULL,
-        approval_level TEXT NOT NULL,
-        approved_at INTEGER NOT NULL,
-        expires_at INTEGER,
-        PRIMARY KEY (skill_url, code_hash)
+        telegram_message_id INTEGER,
+        approval_token TEXT
       );
 
       CREATE TABLE IF NOT EXISTS secrets (
@@ -74,18 +57,6 @@ export class ProxyDatabase {
         value TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS code_analysis (
-        code_hash TEXT PRIMARY KEY,
-        summary TEXT NOT NULL,
-        created_at INTEGER NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS code_reviews (
-        code_hash TEXT PRIMARY KEY,
-        review TEXT NOT NULL,
-        created_at INTEGER NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS sessions (
@@ -106,21 +77,26 @@ export class ProxyDatabase {
         FOREIGN KEY (session_id) REFERENCES sessions(session_id)
       );
 
+      CREATE TABLE IF NOT EXISTS capabilities (
+        spec_hash TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        spec TEXT NOT NULL,
+        code TEXT NOT NULL,
+        doc_domain TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_requests_status ON execution_requests(status);
       CREATE INDEX IF NOT EXISTS idx_requests_created ON execution_requests(created_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_approvals_expires ON skill_approvals(expires_at);
       CREATE INDEX IF NOT EXISTS idx_scope_grants_session ON scope_grants(session_id);
     `);
-    // Migrations
-    try { this.db.exec('ALTER TABLE execution_requests ADD COLUMN code TEXT'); } catch {}
-    try { this.db.exec('ALTER TABLE execution_requests ADD COLUMN approval_token TEXT'); } catch {}
   }
 
   // Execution Requests
-  
+
   createRequest(
     id: string,
-    skillId: string,
+    actionId: string,
     skillUrl: string,
     codeHash: string,
     secrets: string[],
@@ -130,115 +106,41 @@ export class ProxyDatabase {
     this.db.prepare(`
       INSERT INTO execution_requests (id, skill_id, skill_url, code_hash, secrets, args, status, created_at, approval_token)
       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-    `).run(
-      id,
-      skillId,
-      skillUrl,
-      codeHash,
-      JSON.stringify(secrets),
-      args ? JSON.stringify(args) : null,
-      Date.now(),
-      approvalToken || null
-    );
-    pgLog.logExecution(id, this.tenantId, skillId, skillUrl, codeHash);
+    `).run(id, actionId, skillUrl, codeHash, JSON.stringify(secrets), args ? JSON.stringify(args) : null, Date.now(), approvalToken || null);
+    pgLog.logExecution(id, this.tenantId, actionId, skillUrl, codeHash);
   }
 
   getRequest(id: string): ExecutionRecord | undefined {
-    return this.db.prepare(`
-      SELECT * FROM execution_requests WHERE id = ?
-    `).get(id) as ExecutionRecord | undefined;
+    const row = this.db.prepare('SELECT * FROM execution_requests WHERE id = ?').get(id) as any;
+    if (!row) return undefined;
+    // Map old column name to new interface
+    return { ...row, action_id: row.skill_id } as ExecutionRecord;
   }
 
-  updateRequestStatus(id: string, status: string, telegramMessageId?: number): void {
+  updateRequestStatus(id: string, status: string): void {
     const updates: string[] = ['status = ?'];
     const params: any[] = [status, id];
-
-    if (status === 'approved') {
-      updates.push('approved_at = ?');
-      params.splice(1, 0, Date.now());
-    }
-    if (status === 'executing') {
-      updates.push('executed_at = ?');
-      params.splice(1, 0, Date.now());
-    }
-    if (telegramMessageId) {
-      updates.push('telegram_message_id = ?');
-      params.splice(1, 0, telegramMessageId);
-    }
-
-    this.db.prepare(`
-      UPDATE execution_requests SET ${updates.join(', ')} WHERE id = ?
-    `).run(...params);
+    if (status === 'approved') { updates.push('approved_at = ?'); params.splice(1, 0, Date.now()); }
+    if (status === 'executing') { updates.push('executed_at = ?'); params.splice(1, 0, Date.now()); }
+    this.db.prepare(`UPDATE execution_requests SET ${updates.join(', ')} WHERE id = ?`).run(...params);
     pgLog.updateExecutionStatus(id, status);
   }
 
   updateRequestResult(id: string, result: any, error?: string): void {
-    this.db.prepare(`
-      UPDATE execution_requests 
-      SET status = ?, result = ?, error = ?
-      WHERE id = ?
-    `).run(
-      error ? 'failed' : 'completed',
-      result ? JSON.stringify(result) : null,
-      error || null,
-      id
-    );
+    this.db.prepare('UPDATE execution_requests SET status = ?, result = ?, error = ? WHERE id = ?')
+      .run(error ? 'failed' : 'completed', result ? JSON.stringify(result) : null, error || null, id);
     pgLog.updateExecutionResult(id, error ? 'failed' : 'completed', error);
   }
 
-  // Skill Approvals
+  // Cleanup (no more skill_approvals to clean)
+  cleanupExpired(): void {}
 
-  addApproval(
-    skillUrl: string,
-    codeHash: string,
-    approvalLevel: 'once' | '24h' | 'forever'
-  ): void {
-    const expiresAt = approvalLevel === '24h' 
-      ? Date.now() + 24 * 60 * 60 * 1000 
-      : null;
-
-    this.db.prepare(`
-      INSERT OR REPLACE INTO skill_approvals (skill_url, code_hash, approval_level, approved_at, expires_at)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(skillUrl, codeHash, approvalLevel, Date.now(), expiresAt);
-  }
-
-  getApproval(skillUrl: string, codeHash: string): ApprovalRecord | undefined {
-    const approval = this.db.prepare(`
-      SELECT * FROM skill_approvals 
-      WHERE skill_url = ? AND code_hash = ?
-    `).get(skillUrl, codeHash) as ApprovalRecord | undefined;
-
-    // Check if expired
-    if (approval && approval.expires_at && approval.expires_at < Date.now()) {
-      this.deleteApproval(skillUrl, codeHash);
-      return undefined;
-    }
-
-    return approval;
-  }
-
-  deleteApproval(skillUrl: string, codeHash: string): void {
-    this.db.prepare(`
-      DELETE FROM skill_approvals WHERE skill_url = ? AND code_hash = ?
-    `).run(skillUrl, codeHash);
-  }
-
-  // Cleanup expired approvals
-  cleanupExpired(): void {
-    this.db.prepare(`
-      DELETE FROM skill_approvals WHERE expires_at IS NOT NULL AND expires_at < ?
-    `).run(Date.now());
-  }
-
-  // Secrets (persisted)
+  // Secrets
 
   setSecret(name: string, value: string): void {
     const now = Date.now();
-    this.db.prepare(`
-      INSERT INTO secrets (name, value, created_at, updated_at) VALUES (?, ?, ?, ?)
-      ON CONFLICT(name) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-    `).run(name, value, now, now);
+    this.db.prepare('INSERT INTO secrets (name, value, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
+      .run(name, value, now, now);
   }
 
   getAllSecrets(): Record<string, string> {
@@ -263,58 +165,18 @@ export class ProxyDatabase {
     return row?.code ?? null;
   }
 
-  // Code analysis cache
-
-  getAnalysis(codeHash: string): any | undefined {
-    const row = this.db.prepare(
-      'SELECT summary, created_at as timestamp FROM code_analysis WHERE code_hash = ?'
-    ).get(codeHash) as { summary: string; timestamp: number } | undefined;
-    if (!row) return undefined;
-    // Try parsing as structured JSON, fall back to legacy string format
-    try {
-      return JSON.parse(row.summary);
-    } catch {
-      return { summary: row.summary, timestamp: row.timestamp, secretsUsed: [], networkTargets: [], isMutating: true, riskLevel: 'medium' as const, concerns: [] };
-    }
-  }
-
-  setAnalysis(codeHash: string, analysis: any): void {
-    const data = typeof analysis === 'string' ? analysis : JSON.stringify(analysis);
-    this.db.prepare(
-      'INSERT OR REPLACE INTO code_analysis (code_hash, summary, created_at) VALUES (?, ?, ?)'
-    ).run(codeHash, data, Date.now());
-  }
-
-  // Code review cache
-
-  getCodeReview(codeHash: string): any | undefined {
-    const row = this.db.prepare(
-      'SELECT review FROM code_reviews WHERE code_hash = ?'
-    ).get(codeHash) as { review: string } | undefined;
-    if (!row) return undefined;
-    try { return JSON.parse(row.review) } catch { return undefined }
-  }
-
-  setCodeReview(codeHash: string, review: any): void {
-    this.db.prepare(
-      'INSERT OR REPLACE INTO code_reviews (code_hash, review, created_at) VALUES (?, ?, ?)'
-    ).run(codeHash, JSON.stringify(review), Date.now());
-  }
-
-  // Sessions
+  // Sessions (permits)
 
   createSession(sessionId: string, policy: SessionPolicy): void {
     const now = Date.now();
-    this.db.prepare(
-      'INSERT OR REPLACE INTO sessions (session_id, created_at, last_activity, policy) VALUES (?, ?, ?, ?)'
-    ).run(sessionId, now, now, JSON.stringify(policy));
+    this.db.prepare('INSERT OR REPLACE INTO sessions (session_id, created_at, last_activity, policy) VALUES (?, ?, ?, ?)')
+      .run(sessionId, now, now, JSON.stringify(policy));
     pgLog.logSession(sessionId, this.tenantId, policy.description);
   }
 
   getSession(sessionId: string): { session_id: string; created_at: number; last_activity: number; policy: SessionPolicy } | undefined {
     const row = this.db.prepare('SELECT * FROM sessions WHERE session_id = ?').get(sessionId) as any;
     if (!row) return undefined;
-    // Expire after 2 hours of inactivity
     if (Date.now() - row.last_activity > 2 * 60 * 60 * 1000) {
       this.db.prepare('DELETE FROM sessions WHERE session_id = ?').run(sessionId);
       return undefined;
@@ -338,7 +200,6 @@ export class ProxyDatabase {
 
   listSessions(): Array<{ session_id: string; created_at: number; last_activity: number; policy: SessionPolicy }> {
     const now = Date.now();
-    // Clean expired first
     this.db.prepare('DELETE FROM sessions WHERE ? - last_activity > ?').run(now, 2 * 60 * 60 * 1000);
     const rows = this.db.prepare('SELECT * FROM sessions ORDER BY last_activity DESC').all() as any[];
     return rows.map(r => ({ ...r, policy: JSON.parse(r.policy) }));
@@ -347,22 +208,29 @@ export class ProxyDatabase {
   // Scope Grants
 
   addScopeGrant(sessionId: string, description: string | undefined, constraints: PolicyConstraint[], scopeSecrets: string[], networks: string[]): void {
-    this.db.prepare(
-      'INSERT INTO scope_grants (session_id, description, constraints, secrets, networks, approved_at) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(sessionId, description || null, JSON.stringify(constraints), JSON.stringify(scopeSecrets), JSON.stringify(networks), Date.now());
+    this.db.prepare('INSERT INTO scope_grants (session_id, description, constraints, secrets, networks, approved_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(sessionId, description || null, JSON.stringify(constraints), JSON.stringify(scopeSecrets), JSON.stringify(networks), Date.now());
     pgLog.logScopeGrant(sessionId, this.tenantId, description, constraints, networks);
   }
 
   getScopeGrants(sessionId: string): Array<{ id: number; description: string | null; constraints: PolicyConstraint[]; secrets: string[]; networks: string[]; approved_at: number }> {
     const rows = this.db.prepare('SELECT * FROM scope_grants WHERE session_id = ? ORDER BY approved_at').all(sessionId) as any[];
     return rows.map(r => ({
-      id: r.id,
-      description: r.description,
-      constraints: JSON.parse(r.constraints || '[]'),
-      secrets: JSON.parse(r.secrets || '[]'),
-      networks: JSON.parse(r.networks || '[]'),
-      approved_at: r.approved_at
+      id: r.id, description: r.description,
+      constraints: JSON.parse(r.constraints || '[]'), secrets: JSON.parse(r.secrets || '[]'),
+      networks: JSON.parse(r.networks || '[]'), approved_at: r.approved_at
     }));
+  }
+
+  // Capability cache
+
+  getCachedCapability(specHash: string): { code: string; name: string } | undefined {
+    return this.db.prepare('SELECT name, code FROM capabilities WHERE spec_hash = ?').get(specHash) as { name: string; code: string } | undefined;
+  }
+
+  cacheCapability(specHash: string, name: string, spec: any, code: string, docDomain: string): void {
+    this.db.prepare('INSERT OR REPLACE INTO capabilities (spec_hash, name, spec, code, doc_domain, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(specHash, name, JSON.stringify(spec), code, docDomain, Date.now());
   }
 
   listRecentRequests(limit = 20): ExecutionRecord[] {
@@ -374,16 +242,12 @@ export class ProxyDatabase {
   }
 }
 
-import { PolicyConstraint } from './policy.js';
+import { PolicyConstraint } from './capability.js';
+import { CapabilityFunction } from './capability.js';
 
 export interface SessionPolicy {
   allowedSecrets: string[];
   allowedNetworks: string[];
-  allowMutating: boolean;
-  maxRiskLevel: 'low' | 'medium' | 'high';
-  constraints?: string[];
   description?: string;
-  approvedCodeHash?: string;
-  approvedAnalysisSummary?: string;
-  structuredConstraints?: PolicyConstraint[];
+  capabilities?: CapabilityFunction[];
 }

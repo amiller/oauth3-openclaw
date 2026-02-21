@@ -70,57 +70,56 @@ export function analyzeStatic(source: string): StaticAnalysis {
   return { fetchUrls, envVars, imports, hasDynamicFetch, hasEval, lineCount: source.split('\n').length }
 }
 
-function extractHost(url: string): string | null {
-  try { return new URL(url).hostname } catch { return null }
-}
-
-export function verifyAgainstScope(
-  analysis: StaticAnalysis,
-  scope: { secrets: string[]; networks: string[]; argKeys?: string[] }
+export function verifyCapabilityMode(
+  source: string,
+  capabilityNames: string[]
 ): VerificationResult {
   const checks: VerificationCheck[] = []
   const warnings: string[] = []
-  const allowedHosts = scope.networks
-  const allowedVars = [...scope.secrets, ...(scope.argKeys || [])]
 
-  // Check fetch URL hosts
-  const fetchHosts = [...new Set(analysis.fetchUrls.map(f => extractHost(f.url)).filter(Boolean))] as string[]
-  const unauthorizedHosts = fetchHosts.filter(h => !allowedHosts.includes(h))
+  // No fetch() calls in agent code
+  const fetchMatches = [...source.matchAll(/\bfetch\s*\(/g)]
   checks.push({
-    name: 'fetch_urls',
-    passed: unauthorizedHosts.length === 0,
-    expected: allowedHosts.join(', ') || '(none)',
-    actual: fetchHosts.join(', ') || '(none)',
-    details: unauthorizedHosts.length ? `Unauthorized: ${unauthorizedHosts.join(', ')}` : undefined,
+    name: 'no_direct_fetch',
+    passed: fetchMatches.length === 0,
+    expected: 'no fetch() calls',
+    actual: fetchMatches.length ? `${fetchMatches.length} fetch() call(s) found` : 'clean',
   })
 
-  // Check env vars
-  const unauthorizedVars = analysis.envVars.filter(v => !allowedVars.includes(v))
+  // No Deno.env.get() in agent code
+  const envMatches = [...source.matchAll(/Deno\.env\.get\s*\(/g)]
   checks.push({
-    name: 'env_vars',
-    passed: unauthorizedVars.length === 0,
-    expected: allowedVars.join(', ') || '(none)',
-    actual: analysis.envVars.join(', ') || '(none)',
-    details: unauthorizedVars.length ? `Unauthorized: ${unauthorizedVars.join(', ')}` : undefined,
+    name: 'no_direct_env',
+    passed: envMatches.length === 0,
+    expected: 'no Deno.env.get() calls',
+    actual: envMatches.length ? `${envMatches.length} Deno.env.get() call(s) found` : 'clean',
   })
 
-  // No eval
+  // No eval / new Function
+  const hasEval = /\beval\s*\(/.test(source) || /\bnew\s+Function\s*\(/.test(source)
   checks.push({
     name: 'no_eval',
-    passed: !analysis.hasEval,
+    passed: !hasEval,
     expected: 'no eval/Function',
-    actual: analysis.hasEval ? 'eval detected' : 'clean',
+    actual: hasEval ? 'eval detected' : 'clean',
   })
 
-  // Dynamic fetch warning
-  if (analysis.hasDynamicFetch) {
-    warnings.push('Dynamic fetch URLs detected — runtime sandbox will enforce network restrictions')
-  }
+  // No dynamic imports
+  const dynamicImports = [...source.matchAll(/\bimport\s*\(/g)]
+  checks.push({
+    name: 'no_dynamic_import',
+    passed: dynamicImports.length === 0,
+    expected: 'no dynamic imports',
+    actual: dynamicImports.length ? `${dynamicImports.length} dynamic import(s)` : 'clean',
+  })
 
-  // Dynamic imports warning
-  const dynamicImports = analysis.imports.filter(i => !i.startsWith('https://') && !i.startsWith('npm:') && !i.startsWith('node:'))
-  if (dynamicImports.length) {
-    warnings.push(`Relative/unknown imports: ${dynamicImports.join(', ')}`)
+  // Check that code references at least one capability function
+  const referencedCaps = capabilityNames.filter(n => {
+    const funcName = n.includes('.') ? n.split('.').pop()! : n
+    return new RegExp(`\\b${funcName}\\s*\\(`).test(source)
+  })
+  if (referencedCaps.length === 0) {
+    warnings.push('Agent code does not call any declared capabilities')
   }
 
   return {
@@ -129,3 +128,4 @@ export function verifyAgainstScope(
     warnings,
   }
 }
+

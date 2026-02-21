@@ -4,9 +4,7 @@ import { Request, Response, NextFunction } from 'express'
 const JWT_SECRET = process.env.JWT_SECRET || ''
 const API_BEARER_TOKEN = process.env.API_BEARER_TOKEN || ''
 
-// Standalone mode: enclave issues its own JWTs when no JWT_SECRET is configured
-// Hosted mode: orchestrator issues JWTs with shared secret
-const STANDALONE = !JWT_SECRET
+// Enclave always issues its own JWTs. If JWT_SECRET is set, also accepts orchestrator-issued JWTs.
 
 export interface TenantContext {
   tenant_id: string
@@ -45,18 +43,17 @@ function verifyJWT(token: string, secret: string): TenantContext | null {
   } catch { return null }
 }
 
-// --- Standalone: issue tokens directly from enclave ---
+// --- Token issuance ---
 
-let standaloneSecret = ''
+let localSecret = ''
 
 function getSecret(): string {
   if (JWT_SECRET) return JWT_SECRET
-  // Standalone mode: use a per-process secret (or derive from dstack later)
-  if (!standaloneSecret) {
-    standaloneSecret = randomBytes(32).toString('hex')
-    console.log('🔑 Standalone mode: generated local JWT secret')
+  if (!localSecret) {
+    localSecret = randomBytes(32).toString('hex')
+    console.log('🔑 Generated local JWT secret')
   }
-  return standaloneSecret
+  return localSecret
 }
 
 export function issueToken(tenantId: string, plan = 'free'): string {
@@ -94,9 +91,8 @@ export function requireTenant(req: Request, res: Response, next: NextFunction) {
   res.status(401).json({ error: 'Invalid token' })
 }
 
-// Standalone signup endpoint — enclave issues JWT directly
+// Signup — enclave always issues tokens directly
 export function handleSignup(req: Request, res: Response) {
-  if (!STANDALONE) return res.status(404).json({ error: 'Signup not available — use orchestrator' })
   const { name } = req.body || {}
   const tenantId = `tenant_${randomBytes(8).toString('hex')}`
   const token = issueToken(tenantId)

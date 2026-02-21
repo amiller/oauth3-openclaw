@@ -22,7 +22,7 @@ services:
     restart: unless-stopped
 
   oauth3-proxy:
-    image: ghcr.io/amiller/oauth3-proxy@sha256:90bf508de7a0ecafd37bc2b0bb0b104bd13ac0927c16acb5a5bfb431af1ebf7a
+    image: ghcr.io/amiller/oauth3-proxy@sha256:2ff6b242017504efbbcc9c0840ad3d6c4a3a668ef28b35060695805aed101f91
     ports:
       - "3737:3737"
     environment:
@@ -34,6 +34,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:-}
       PUBLIC_URL: https://${DOMAIN}
       ORCHESTRATOR_URL: ${ORCHESTRATOR_URL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     volumes:
