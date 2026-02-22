@@ -2,7 +2,6 @@ import { createHmac, randomBytes } from 'crypto'
 import { Request, Response, NextFunction } from 'express'
 
 const JWT_SECRET = process.env.JWT_SECRET || ''
-const API_BEARER_TOKEN = process.env.API_BEARER_TOKEN || ''
 
 // Enclave always issues its own JWTs. If JWT_SECRET is set, also accepts orchestrator-issued JWTs.
 
@@ -67,7 +66,7 @@ export function requireTenant(req: Request, res: Response, next: NextFunction) {
   const auth = req.headers.authorization
   if (!auth) {
     // Dev fallback: no auth configured = open access
-    if (!JWT_SECRET && !API_BEARER_TOKEN) {
+    if (!JWT_SECRET) {
       ;(req as any).tenant = { tenant_id: 'dev', role: 'owner' as const, plan: 'free', iat: 0, exp: Infinity }
       return next()
     }
@@ -81,12 +80,6 @@ export function requireTenant(req: Request, res: Response, next: NextFunction) {
   if (tenant) {
     if (!tenant.role) tenant.role = 'agent' // legacy tokens default to agent
     ;(req as any).tenant = tenant
-    return next()
-  }
-
-  // Fallback: legacy bearer token (backwards compat during migration)
-  if (API_BEARER_TOKEN && token === API_BEARER_TOKEN) {
-    ;(req as any).tenant = { tenant_id: req.headers['x-tenant-id'] as string || 'legacy', role: 'agent' as const, plan: 'free', iat: 0, exp: Infinity }
     return next()
   }
 

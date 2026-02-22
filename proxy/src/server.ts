@@ -3,10 +3,11 @@
  * Capabilities-only execution path: permit → action
  */
 
+import './ses-init.js';
 import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import { ProxyDatabase, SessionPolicy } from './database.js';
-import { execute, hashCode, EXECUTOR_MODE } from './executor.js';
+import { execute, hashCode } from './executor.js';
 import { CapabilitySpec, CapabilityFunction, hashSpec, tokenUsage, getPlugin } from './capability.js';
 import { requireTenant, requireOwner, handleSignup, TenantContext, verifyTokenDirect } from './auth.js';
 import * as pgLog from './postgres.js';
@@ -72,14 +73,13 @@ app.get('/', (_req: Request, res: Response) => {
   res.type('text/markdown').send(`# OAuth3 Execution Proxy
 
 TEE-sandboxed code execution with human-approved permits.
-Your code runs in a Deno sandbox with access to secrets you don't hold directly.
+Your code runs in a SES Compartment with only the capability functions you were granted.
 
 ## How It Works
 
 1. **Request a permit** — describe what capabilities you need (API endpoints, secrets, networks).
 2. **Human approves the permit** — they see the capability specs, not your code.
-3. **Submit actions** under the permit — code + args, verified programmatically.
-4. **System enforces** — AST static analysis checks your code only calls declared capabilities.
+3. **Submit actions** under the permit — code runs in a SES Compartment with only declared capabilities as endowments.
 
 ## Authentication
 
@@ -93,17 +93,22 @@ Use on all requests: \`Authorization: Bearer <token>\`
 ## Quick Start
 
 1. \`POST /signup\` to get a token
-2. \`POST /permit\` with \`capabilities\` array → get \`approval_url\` + \`permit_id\`
-3. Human approves at \`approval_url\`
-4. \`POST /execute\` with \`{ action_id, code, args, permit_id }\` → auto-verified and executed
-5. \`GET /execute/:id/status?wait=true\` → long-poll for result
+2. \`POST /permit\` with \`capabilities\` array → get \`approval_url\`, \`permit_id\`, \`status_url\`
+3. **Poll \`status_url\`** (long-poll, blocks up to 120s) — wait until status is \`"completed"\` (approved)
+4. \`POST /execute\` with \`{ action_id, code, args, permit_id }\` → get \`status_url\`
+5. **Poll \`status_url\`** again — wait until execution finishes
 
 \`\`\`
-POST /permit  → { status: "pending_permit", approval_url, permit_id }
-# Human approves
-POST /execute → { status: "approved", request_id }
-GET  /execute/:id/status?wait=true → { status: "completed", result: {...} }
+POST /permit  → { status: "pending_permit", approval_url, permit_id, status_url }
+GET  status_url?wait=true  → blocks until → { status: "completed", permit_id }
+POST /execute → { status: "approved", request_id, status_url }
+GET  status_url?wait=true  → blocks until → { status: "completed", result: {...} }
 \`\`\`
+
+**IMPORTANT**:
+- Always use the \`status_url\` from the response to poll — it already includes \`?wait=true\`. Do NOT append query params.
+- Do NOT poll \`/sessions/:id\` — that returns permit policy, not approval status.
+- \`status_url\` long-polls (blocks up to 120s). Just \`fetch(status_url)\` in a loop.
 
 ## Endpoints
 
@@ -132,26 +137,33 @@ GET  /execute/:id/status?wait=true → { status: "completed", result: {...} }
 
 ### POST /execute — Submit an Action
 
+The permit response includes a \`capabilities[].signature\` field showing the exact function available in the sandbox.
+For example, a capability named \`github.createIssue\` generates: \`async function createIssue(owner, repo, title, body)\`
+
 \`\`\`json
 {
   "action_id": "create-issue",
-  "code": "const r = await github.createIssue({owner:'amiller', repo:'test', title:args.title, body:args.body});\\nconsole.log(JSON.stringify(r));",
-  "args": { "title": "Test issue", "body": "Created by agent" },
+  "code": "const r = await createIssue(args.owner, args.repo, args.title, args.body);\\nconsole.log(JSON.stringify(r));",
+  "args": { "owner": "amiller", "repo": "test", "title": "Test issue", "body": "Created by agent" },
   "permit_id": "permit_abc123"
 }
 \`\`\`
 
-Agent code calls capability functions (e.g. \`github.createIssue\`) — no direct \`fetch()\` or \`Deno.env.get()\` allowed.
+The SES Compartment endows: capability functions (from \`signature\`), \`args\` object, and \`console\`. No \`fetch()\`, no \`Deno.env\` — use the generated functions.
 
 ### GET /execute/:id/status?wait=true — Poll for Result
 
-Long-polls up to 120s. Returns on terminal status.
+Long-polls up to 120s. Returns immediately if already in a terminal state (\`completed\`, \`failed\`, \`denied\`).
+Use this for BOTH permit approval polling and execution result polling — the \`status_url\` from \`/permit\` and \`/execute\` responses points here.
+
+Response: \`{ request_id, status, permit_id?, result?, error? }\`
 
 ### Other Endpoints
-- \`GET /sessions\` — list active permits
-- \`GET /sessions/:id\` — permit detail
+- \`GET /sessions\` — list active permits (policy details, not approval status)
+- \`GET /sessions/:id\` — permit policy detail
+- \`GET /session/:id/actions\` — list actions under a permit (Bearer auth)
 - \`DELETE /sessions/:id\` — revoke a permit
-- \`POST /secrets\` — \`{ name, value }\`
+- \`POST /secrets\` — \`{ name, value }\` (owner only)
 - \`GET /secrets\` — list secret names (not values)
 - \`GET /health\` — status check
 
@@ -343,12 +355,26 @@ app.post('/approve/:id', async (req: Request, res: Response) => {
 app.get('/session/:id/actions', (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const token = req.query.token as string;
-  if (!token) return res.status(401).json({ error: 'Token required' });
-  const scopeReq = (() => {
-    const requests = db.listRecentRequests(100);
-    return requests.find((r: any) => r.skill_url === 'scope' && r.approval_token === token && r.args && JSON.parse(r.args).sessionId === id);
-  })();
-  if (!scopeReq) return res.status(403).json({ error: 'Invalid token for this session' });
+  const auth = req.headers.authorization;
+
+  // Auth: approval_token query param OR Bearer JWT (agent/owner of session)
+  if (token) {
+    const scopeReq = (() => {
+      const requests = db.listRecentRequests(100);
+      return requests.find((r: any) => r.skill_url === 'scope' && r.approval_token === token && r.args && JSON.parse(r.args).sessionId === id);
+    })();
+    if (!scopeReq) return res.status(403).json({ error: 'Invalid token for this session' });
+  } else if (auth) {
+    const jwt = auth.replace(/^Bearer\s+/i, '');
+    const tenant = verifyTokenDirect(jwt);
+    if (!tenant) return res.status(401).json({ error: 'Invalid token' });
+    const session = db.getSession(id);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    if (session.agent_id !== tenant.tenant_id && session.owner_id !== tenant.tenant_id)
+      return res.status(403).json({ error: 'Not authorized for this session' });
+  } else {
+    return res.status(401).json({ error: 'Token required (query param or Authorization header)' });
+  }
   const requests = db.listRecentRequests(50);
   const actions = requests.filter((r: any) => {
     if (r.skill_url === 'scope') return false;
@@ -363,13 +389,13 @@ app.get('/session/:id/actions', (req: Request, res: Response) => {
 // POST /permit (was /scope)
 app.post('/permit', requireTenant, syncTenant, async (req: Request, res: Response) => {
   try {
-    const { permit_id: clientPermitId, description, capabilities: rawCapabilities } = req.body;
+    const { permit_id: clientPermitId, description, capabilities: rawCapabilities, networks: extraNetworks } = req.body;
     if (!description) return res.status(400).json({ error: 'Missing description' });
     if (!Array.isArray(rawCapabilities) || !rawCapabilities.length) return res.status(400).json({ error: 'Missing capabilities array' });
 
     const permitId = clientPermitId || `permit_${randomBytes(8).toString('hex')}`;
     let secretsList: string[] = [];
-    let networksList: string[] = [];
+    let networksList: string[] = Array.isArray(extraNetworks) ? [...extraNetworks] : [];
 
     // Validate specs via plugins, auto-derive secrets/networks, generate code
     const capabilitySpecs: CapabilitySpec[] = [];
@@ -483,10 +509,16 @@ app.post('/execute', requireTenant, syncTenant, async (req: Request, res: Respon
       })),
     };
 
+    // Rebuild endowments from specs (endowments are functions, not serializable)
+    const caps = await Promise.all(session.policy.capabilities.map(async (c) => {
+      const plugin = getPlugin(c.spec?.type || 'api-gateway');
+      if (!plugin || !c.spec) return c;
+      const result = await plugin.codegen(c.spec);
+      return { ...c, endowment: result.endowment };
+    }));
+
     db.updateRequestStatus(requestId, 'approved');
-    const capDefs = session.policy.capabilities.map(c => c.code).join('\n\n');
-    const execCode = capDefs + '\n\n// --- Agent code ---\n' + actionCode;
-    executeInBackground(requestId, execCode, session.policy.allowedNetworks, secretsList, session.owner_id, args, enforcement);
+    executeInBackground(requestId, actionCode, caps, secretsList, session.owner_id, args, enforcement);
     const statusUrl = PUBLIC_URL ? `${PUBLIC_URL}/execute/${requestId}/status?wait=true` : undefined;
     return res.json({ request_id: requestId, status: 'approved', permit_id: effectivePermitId, status_url: statusUrl, message: 'Auto-approved (capability mode)' });
   } catch (error: any) {
@@ -534,40 +566,43 @@ async function handleStatus(req: Request, res: Response) {
   const request = db.getRequest(id);
   if (!request) return res.status(404).json({ error: 'Request not found' });
 
-  const wantWait = req.query.wait === 'true' || req.query.wait === '1';
+  const wantWait = String(req.query.wait || '').startsWith('true') || req.query.wait === '1';
+  const maxWait = Math.min(parseInt(req.query.timeout as string) || 600_000, 600_000); // default 10min, max 10min
   const terminal = ['completed', 'failed', 'denied'];
 
   if (wantWait && !terminal.includes(request.status)) {
-    await new Promise<void>(resolve => {
-      const timeout = setTimeout(resolve, 120_000);
-      const entry = () => { clearTimeout(timeout); resolve(); };
-      if (!statusWaiters.has(id)) statusWaiters.set(id, []);
-      statusWaiters.get(id)!.push(entry);
-    });
-    const updated = db.getRequest(id);
-    if (updated) return res.json(buildStatusResponse(updated));
+    const deadline = Date.now() + maxWait;
+    while (Date.now() < deadline) {
+      const wait = Math.min(120_000, deadline - Date.now());
+      if (wait <= 0) break;
+      await new Promise<void>(resolve => {
+        const timeout = setTimeout(resolve, wait);
+        const entry = () => { clearTimeout(timeout); resolve(); };
+        if (!statusWaiters.has(id)) statusWaiters.set(id, []);
+        statusWaiters.get(id)!.push(entry);
+      });
+      const updated = db.getRequest(id);
+      if (updated && terminal.includes(updated.status)) return res.json(buildStatusResponse(updated));
+    }
   }
 
-  res.json(buildStatusResponse(request));
+  const latest = db.getRequest(id);
+  res.json(buildStatusResponse(latest || request));
 }
 
 // Background execution
-async function executeInBackground(requestId: string, code: string, allowedNetworks: string[], requiredSecrets: string[], ownerId: string | null, args?: Record<string, any>, enforcement?: any) {
+async function executeInBackground(requestId: string, code: string, capabilities: CapabilityFunction[], requiredSecrets: string[], ownerId: string | null, args?: Record<string, any>, enforcement?: any) {
   console.log(`\n🚀 Starting background execution for ${requestId}`);
   try {
     db.updateRequestStatus(requestId, 'executing');
     const dbRequest = db.getRequest(requestId);
     const execArgs = args || (dbRequest?.args ? JSON.parse(dbRequest.args) : {});
 
-    // Load secrets from owner's vault
     const ownerSecrets = ownerId ? db.getSecretsByOwner(ownerId) : {};
-    // Also check legacy secrets for backward compat
-    const legacySecrets = db.getSecretsByOwner('legacy');
     const secretValues: Record<string, string> = {};
     const missingSecrets: string[] = [];
     for (const name of requiredSecrets) {
       if (ownerSecrets[name]) secretValues[name] = ownerSecrets[name];
-      else if (legacySecrets[name]) secretValues[name] = legacySecrets[name];
       else missingSecrets.push(name);
     }
 
@@ -578,7 +613,7 @@ async function executeInBackground(requestId: string, code: string, allowedNetwo
       return;
     }
 
-    const result = await execute({ code, secrets: secretValues, args: execArgs, timeout: 30, allowedNetworks });
+    const result = await execute({ code, secrets: secretValues, args: execArgs, timeout: 30, capabilities });
     console.log(`  Execution complete:`, result.success ? '✅' : '❌');
 
     const resultData: any = {
@@ -588,7 +623,7 @@ async function executeInBackground(requestId: string, code: string, allowedNetwo
     if (enforcement) {
       resultData.enforcement = {
         ...enforcement,
-        sandbox: { allowNet: allowedNetworks, allowEnv: [...requiredSecrets, ...Object.keys(execArgs).filter(k => !k.startsWith('_'))] },
+        sandbox: { type: 'ses-compartment', endowments: capabilities.map(c => c.name) },
         runtime: { exitCode: result.exitCode, duration: result.duration },
       };
     }
@@ -611,7 +646,7 @@ setInterval(() => db.cleanupExpired(), 60 * 60 * 1000);
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Execution Proxy running on port ${PORT}`);
   console.log(`📊 Database: ${DB_PATH}`);
-  console.log(`⚙️  Executor: ${EXECUTOR_MODE} mode`);
+  console.log(`⚙️  Executor: SES Compartment`);
   console.log(`🔗 Public URL: ${PUBLIC_URL || '(not set)'}`);
 });
 

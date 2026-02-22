@@ -1,8 +1,13 @@
 import { PolicyConstraint } from '../capability.js'
 
+export interface EndowmentFactory {
+  build(secrets: Record<string, string>): (...args: any[]) => Promise<any>
+}
+
 export interface PluginCodegenResult {
   code: string
   signature: string
+  endowment: EndowmentFactory
 }
 
 export interface CapabilityPlugin {

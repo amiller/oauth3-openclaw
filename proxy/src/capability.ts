@@ -28,6 +28,7 @@ export interface CapabilityFunction {
   hash: string
   doc_domain: string
   signature?: string
+  endowment?: import('./plugins/types.js').EndowmentFactory
 }
 
 export function hashSpec(spec: CapabilitySpec): string {

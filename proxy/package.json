@@ -19,7 +19,8 @@
     "dotenv": "^17.2.4",
     "express": "^5.2.1",
     "node-telegram-bot-api": "^0.67.0",
-    "pg": "^8.13.0"
+    "pg": "^8.13.0",
+    "ses": "^1.14.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

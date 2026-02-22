@@ -1,4 +1,4 @@
-import { CapabilityPlugin, PluginCodegenResult, ApiGatewaySpec } from './types.js'
+import { CapabilityPlugin, PluginCodegenResult, ApiGatewaySpec, EndowmentFactory } from './types.js'
 
 function validate(spec: any): { valid: boolean; errors: string[] } {
   const errors: string[] = []
@@ -104,10 +104,62 @@ function codegen(spec: ApiGatewaySpec): Promise<PluginCodegenResult> {
   }
 
   L.push(`  const _r = await fetch(_url, {${fetchOpts.join(', ')}});`)
+  L.push(`  if (!_r.ok) { const _e = await _r.text(); throw new Error(\`HTTP \${_r.status}: \${_e}\`); }`)
   L.push(spec.response === 'text' ? `  return _r.text();` : `  return _r.json();`)
   L.push(`}`)
 
-  return Promise.resolve({ code: L.join('\n'), signature })
+  const endowment: EndowmentFactory = {
+    build(secrets: Record<string, string>) {
+      return async (...callArgs: any[]) => {
+        const paramEntries = Object.entries(spec.params)
+        const argMap: Record<string, string> = {}
+        paramEntries.forEach(([name, _], i) => { argMap[name] = callArgs[i] })
+
+        for (const [name, p] of paramEntries) {
+          if (!p.constraint) continue
+          const val = argMap[name]
+          const c = p.constraint
+          if (c.type === 'regex' && !new RegExp(c.pattern).test(val))
+            throw new Error(`${name}: ${c.rationale}`)
+          if (c.type === 'predicate' && !(eval(`"${val}" ${c.op} ${JSON.stringify(c.value)}`)))
+            throw new Error(`${name}: ${c.rationale}`)
+        }
+
+        let url = spec.endpoint.replace(/\{(\w+)\}/g, (_, k) => argMap[k])
+        const queryP = paramEntries.filter(([, v]) => v.in === 'query')
+        if (queryP.length) {
+          const u = new URL(url)
+          for (const [n] of queryP) if (argMap[n] !== undefined) u.searchParams.set(n, argMap[n])
+          url = u.toString()
+        }
+
+        const headers: Record<string, string> = {}
+        if (spec.auth) {
+          headers[spec.auth.header] = spec.auth.value.replace(
+            /\{([A-Z_][A-Z0-9_]*)\}/g, (_, k) => secrets[k] || ''
+          )
+        }
+
+        const bodyP = paramEntries.filter(([, v]) => v.in === 'body')
+        const opts: RequestInit = { method: spec.method, headers }
+        if (bodyP.length) {
+          headers['Content-Type'] = 'application/json'
+          const bodyObj: Record<string, any> = {}
+          for (const [n] of bodyP) bodyObj[n] = argMap[n]
+          if (spec.rpc_wrap)
+            opts.body = JSON.stringify({ jsonrpc: '2.0', method: spec.rpc_method, params: bodyObj, id: 1 })
+          else
+            opts.body = JSON.stringify(bodyObj)
+        }
+
+        const r = await fetch(url, opts)
+        if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`)
+        return spec.response === 'text' ? r.text() : r.json()
+      }
+    }
+  }
+
+  return Promise.resolve({ code: L.join('\n'), signature, endowment })
 }
 
 export const apiGatewayPlugin: CapabilityPlugin = {
