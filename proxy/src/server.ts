@@ -135,6 +135,17 @@ GET  status_url?wait=true  → blocks until → { status: "completed", result: {
 }
 \`\`\`
 
+#### Capability spec fields
+- \`name\` — dot-separated identifier (e.g. \`github.createIssue\`). Last segment becomes the function name.
+- \`doc_url\` — link to API documentation
+- \`endpoint\` — URL template with \`{param}\` placeholders
+- \`method\` — HTTP method
+- \`auth\` — \`{ header, value }\` where value can reference secrets like \`{GH_TOKEN}\`
+- \`params\` — \`{ name: { in: "path"|"body"|"query", constraint? } }\`
+- \`response\` — \`"json"\` (default), \`"text"\`, or \`"binary"\` (returns base64-encoded bytes)
+
+Use \`response: "binary"\` for endpoints that return non-text data (ZIP files, images, etc). The capability function returns a base64 string.
+
 ### POST /execute — Submit an Action
 
 The permit response includes a \`capabilities[].signature\` field showing the exact function available in the sandbox.
@@ -187,6 +198,15 @@ app.post('/secrets', requireTenant, syncTenant, requireOwner, (req: Request, res
   if (!name || !value) return res.status(400).json({ error: 'Missing name or value' });
   db.setSecret(name, value, tenant.tenant_id);
   res.json({ success: true, name });
+});
+
+app.post('/cookies/upload', requireTenant, syncTenant, requireOwner, (req: Request, res: Response) => {
+  const { domain, cookies, user_agent } = req.body;
+  const tenant = (req as any).tenant as TenantContext;
+  if (!domain || !Array.isArray(cookies)) return res.status(400).json({ error: 'Missing domain or cookies array' });
+  const secretName = `COOKIES_${domain.replace(/^www\./, '').replace(/\./g, '_').toUpperCase()}`;
+  db.setSecret(secretName, JSON.stringify({ cookies, user_agent: user_agent || '' }), tenant.tenant_id);
+  res.json({ success: true, secret_name: secretName });
 });
 
 app.get('/secrets', requireTenant, syncTenant, requireOwner, (req: Request, res: Response) => {
