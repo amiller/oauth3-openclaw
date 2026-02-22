@@ -35,5 +35,5 @@ export interface ApiGatewaySpec extends PluginSpec {
   params: Record<string, { in: 'path' | 'body' | 'query'; constraint?: PolicyConstraint }>
   rpc_method?: string
   rpc_wrap?: boolean
-  response?: 'json' | 'text'
+  response?: 'json' | 'text' | 'binary'
 }

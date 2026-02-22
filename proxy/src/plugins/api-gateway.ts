@@ -105,7 +105,10 @@ function codegen(spec: ApiGatewaySpec): Promise<PluginCodegenResult> {
 
   L.push(`  const _r = await fetch(_url, {${fetchOpts.join(', ')}});`)
   L.push(`  if (!_r.ok) { const _e = await _r.text(); throw new Error(\`HTTP \${_r.status}: \${_e}\`); }`)
-  L.push(spec.response === 'text' ? `  return _r.text();` : `  return _r.json();`)
+  const retLine = spec.response === 'binary'
+    ? `  return Buffer.from(await _r.arrayBuffer()).toString('base64');`
+    : spec.response === 'text' ? `  return _r.text();` : `  return _r.json();`
+  L.push(retLine)
   L.push(`}`)
 
   const endowment: EndowmentFactory = {
@@ -154,6 +157,7 @@ function codegen(spec: ApiGatewaySpec): Promise<PluginCodegenResult> {
 
         const r = await fetch(url, opts)
         if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`)
+        if (spec.response === 'binary') return Buffer.from(await r.arrayBuffer()).toString('base64')
         return spec.response === 'text' ? r.text() : r.json()
       }
     }
