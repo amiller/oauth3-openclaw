@@ -47,6 +47,8 @@ export async function execute(request: ExecutionRequest): Promise<ExecutionResul
     endowments.JSON = JSON
     endowments.Error = Error
     endowments.Promise = Promise
+    endowments.atob = harden((s: string) => Buffer.from(s, 'base64').toString('binary'))
+    endowments.btoa = harden((s: string) => Buffer.from(s, 'binary').toString('base64'))
 
     const compartment = new Compartment(endowments)
     const timeout = (request.timeout || 30) * 1000
