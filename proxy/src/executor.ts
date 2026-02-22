@@ -49,6 +49,10 @@ export async function execute(request: ExecutionRequest): Promise<ExecutionResul
     endowments.Promise = Promise
     endowments.atob = harden((s: string) => Buffer.from(s, 'base64').toString('binary'))
     endowments.btoa = harden((s: string) => Buffer.from(s, 'binary').toString('base64'))
+    endowments.TextEncoder = TextEncoder
+    endowments.TextDecoder = TextDecoder
+    endowments.URL = URL
+    endowments.URLSearchParams = URLSearchParams
 
     const compartment = new Compartment(endowments)
     const timeout = (request.timeout || 30) * 1000
