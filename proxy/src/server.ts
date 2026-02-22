@@ -7,9 +7,8 @@ import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import { ProxyDatabase, SessionPolicy } from './database.js';
 import { execute, hashCode, EXECUTOR_MODE } from './executor.js';
-// ast-analyzer.ts kept for analyzeStatic (non-capability mode) but not used as a gate
-import { CapabilitySpec, CapabilityFunction, validateSpec, extractSecrets, extractNetworks, summarizeSpec, hashSpec, draftCapability, fetchDocContent, tokenUsage, PolicyConstraint } from './capability.js';
-import { requireTenant, handleSignup, TenantContext } from './auth.js';
+import { CapabilitySpec, CapabilityFunction, hashSpec, tokenUsage, getPlugin } from './capability.js';
+import { requireTenant, requireOwner, handleSignup, TenantContext, verifyTokenDirect } from './auth.js';
 import * as pgLog from './postgres.js';
 import { randomBytes } from 'crypto';
 
@@ -55,11 +54,8 @@ function buildApprovalUrl(requestId: string, approvalToken: string, req: any): s
 
 const db = new ProxyDatabase(DB_PATH);
 
-const secrets: Record<string, string> = db.getAllSecrets();
-console.log(`🔑 Loaded ${Object.keys(secrets).length} secrets from database`);
-
 // Helper: reconstruct permit request data from DB
-function getPermitRequest(requestId: string): { permitId: string; description: string; secrets: string[]; networks: string[]; capabilities?: CapabilitySpec[]; draftedCapabilities?: CapabilityFunction[] } | null {
+function getPermitRequest(requestId: string): { permitId: string; description: string; secrets: string[]; networks: string[]; capabilities?: CapabilitySpec[]; draftedCapabilities?: CapabilityFunction[]; agentId?: string } | null {
   const request = db.getRequest(requestId);
   if (!request || request.skill_url !== 'scope') return null;
   try {
@@ -67,7 +63,7 @@ function getPermitRequest(requestId: string): { permitId: string; description: s
     if (!code) return null;
     const data = JSON.parse(code);
     const args = request.args ? JSON.parse(request.args) : {};
-    return { permitId: args.sessionId || '', description: data.description || '', secrets: data.secrets || [], networks: data.networks || [], capabilities: data.capabilities, draftedCapabilities: data.draftedCapabilities };
+    return { permitId: args.sessionId || '', description: data.description || '', secrets: data.secrets || [], networks: data.networks || [], capabilities: data.capabilities, draftedCapabilities: data.draftedCapabilities, agentId: data.agentId };
   } catch { return null; }
 }
 
@@ -159,9 +155,6 @@ Long-polls up to 120s. Returns on terminal status.
 - \`GET /secrets\` — list secret names (not values)
 - \`GET /health\` — status check
 
-## Available Secrets
-${Object.keys(secrets).map(s => '- ' + s).join('\n') || '(none configured)'}
-
 ---
 Public URL: ${PUBLIC_URL || '(not configured)'}
 `);
@@ -176,23 +169,25 @@ app.get('/dashboard', requireTenant, syncTenant, (req: Request, res: Response) =
   res.json({ sessions, requests });
 });
 
-app.post('/secrets', requireTenant, syncTenant, (req: Request, res: Response) => {
+app.post('/secrets', requireTenant, syncTenant, requireOwner, (req: Request, res: Response) => {
   const { name, value } = req.body;
+  const tenant = (req as any).tenant as TenantContext;
   if (!name || !value) return res.status(400).json({ error: 'Missing name or value' });
-  secrets[name] = value;
-  db.setSecret(name, value);
+  db.setSecret(name, value, tenant.tenant_id);
   res.json({ success: true, name });
 });
 
-app.get('/secrets', requireTenant, syncTenant, (_req: Request, res: Response) => {
-  res.json({ secrets: Object.keys(secrets) });
+app.get('/secrets', requireTenant, syncTenant, requireOwner, (req: Request, res: Response) => {
+  const tenant = (req as any).tenant as TenantContext;
+  res.json({ secrets: db.getSecretNamesByOwner(tenant.tenant_id) });
 });
 
-app.delete('/secrets/:name', requireTenant, syncTenant, (req: Request, res: Response) => {
+app.delete('/secrets/:name', requireTenant, syncTenant, requireOwner, (req: Request, res: Response) => {
+  const tenant = (req as any).tenant as TenantContext;
   const name = typeof req.params.name === 'string' ? req.params.name : req.params.name[0];
-  if (!secrets[name]) return res.status(404).json({ error: 'Secret not found' });
-  delete secrets[name];
-  db.deleteSecret(name);
+  const existing = db.getSecretNamesByOwner(tenant.tenant_id);
+  if (!existing.includes(name)) return res.status(404).json({ error: 'Secret not found' });
+  db.deleteSecret(name, tenant.tenant_id);
   res.json({ success: true, deleted: name });
 });
 
@@ -200,10 +195,15 @@ app.get('/stats', (_req: Request, res: Response) => {
   res.json({ haiku_tokens: tokenUsage });
 });
 
-app.get('/sessions', requireTenant, syncTenant, (_req: Request, res: Response) => {
+app.get('/sessions', requireTenant, syncTenant, (req: Request, res: Response) => {
+  const tenant = (req as any).tenant as TenantContext;
   const sessions = db.listSessions();
+  const filtered = sessions.filter(s => {
+    if (tenant.role === 'owner') return s.owner_id === tenant.tenant_id;
+    return s.agent_id === tenant.tenant_id;
+  });
   res.json({
-    sessions: sessions.map(s => ({
+    sessions: filtered.map(s => ({
       permit_id: s.session_id,
       created_at: s.created_at,
       last_activity: s.last_activity,
@@ -245,7 +245,14 @@ app.get('/approve/:id', (req: Request, res: Response) => {
   if (!token || token !== request.approval_token) return res.status(403).json({ error: 'Invalid token' });
 
   const permitReq = getPermitRequest(id);
-  const storedSecretNames = Object.keys(db.getAllSecrets());
+
+  // If owner token provided, check which secrets they already have
+  let ownerSecretNames: string[] = [];
+  const ownerAuth = req.query.owner_token as string || req.headers.authorization?.replace(/^Bearer\s+/i, '');
+  if (ownerAuth) {
+    const owner = verifyTokenDirect(ownerAuth);
+    if (owner?.role === 'owner') ownerSecretNames = db.getSecretNamesByOwner(owner.tenant_id);
+  }
 
   res.json({
     id,
@@ -258,7 +265,7 @@ app.get('/approve/:id', (req: Request, res: Response) => {
       description: permitReq.description,
       secrets: permitReq.secrets,
       networks: permitReq.networks,
-      missing_secrets: permitReq.secrets.filter(s => !storedSecretNames.includes(s)),
+      missing_secrets: permitReq.secrets.filter(s => !ownerSecretNames.includes(s)),
       capabilities: permitReq.capabilities,
       drafted_capabilities: permitReq.draftedCapabilities,
     } : undefined,
@@ -267,14 +274,22 @@ app.get('/approve/:id', (req: Request, res: Response) => {
   });
 });
 
-// Process approval (JSON API)
+// Process approval (JSON API) — requires owner JWT
 app.post('/approve/:id', async (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
-  const { token, action, secrets: providedSecrets } = req.body;
+  const { token, action, secrets: providedSecrets, owner_token } = req.body;
   const request = db.getRequest(id);
   if (!request) return res.status(404).json({ error: 'Not found' });
   if (!token || token !== request.approval_token) return res.status(403).json({ error: 'Invalid token' });
   if (request.status !== 'pending') return res.json({ id, status: request.status, message: 'Already processed' });
+
+  // Authenticate the owner
+  let ownerTenant: TenantContext | null = null;
+  const authHeader = req.headers.authorization;
+  if (authHeader) ownerTenant = verifyTokenDirect(authHeader.replace(/^Bearer\s+/i, ''));
+  if (!ownerTenant && owner_token) ownerTenant = verifyTokenDirect(owner_token);
+  if (!ownerTenant) return res.status(401).json({ error: 'Owner authentication required — provide owner_token in body or Authorization header' });
+  if (ownerTenant.role !== 'owner') return res.status(403).json({ error: 'Only owner role can approve permits' });
 
   if (action === 'deny') {
     db.updateRequestStatus(id, 'denied');
@@ -282,16 +297,19 @@ app.post('/approve/:id', async (req: Request, res: Response) => {
     return res.json({ id, status: 'denied' });
   }
 
-  // Store any secrets provided with the approval
+  const ownerId = ownerTenant.tenant_id;
+
+  // Store any secrets provided with the approval (scoped to this owner)
   if (providedSecrets && typeof providedSecrets === 'object') {
     for (const [n, v] of Object.entries(providedSecrets)) {
-      if (v) { secrets[n] = v as string; db.setSecret(n, v as string); }
+      if (v) db.setSecret(n, v as string, ownerId);
     }
   }
 
   // Permit approval — create session with capabilities
   const permitReq = getPermitRequest(id);
   if (permitReq) {
+    const agentId = permitReq.agentId;
     const existingSession = db.getSession(permitReq.permitId);
     if (existingSession) {
       const p = existingSession.policy;
@@ -306,17 +324,16 @@ app.post('/approve/:id', async (req: Request, res: Response) => {
         description: permitReq.description,
         capabilities: permitReq.draftedCapabilities?.length ? permitReq.draftedCapabilities : undefined,
       };
-      db.createSession(permitReq.permitId, policy);
+      db.createSession(permitReq.permitId, policy, agentId, ownerId);
     }
 
     db.addScopeGrant(permitReq.permitId, permitReq.description, [], permitReq.secrets, permitReq.networks);
     db.updateRequestStatus(id, 'completed');
     notifyStatusWaiters(id);
-    console.log(`📋 Permit approved, session ${permitReq.permitId} ${existingSession ? 'expanded' : 'created'}`);
+    console.log(`📋 Permit approved by owner ${ownerId}, session ${permitReq.permitId} ${existingSession ? 'expanded' : 'created'}`);
     return res.json({ id, status: 'completed', permit_id: permitReq.permitId, expanded: !!existingSession });
   }
 
-  // Should not reach here in capabilities-only mode
   db.updateRequestStatus(id, 'denied');
   notifyStatusWaiters(id);
   res.json({ id, status: 'denied', error: 'Direct execution approval no longer supported' });
@@ -354,47 +371,47 @@ app.post('/permit', requireTenant, syncTenant, async (req: Request, res: Respons
     let secretsList: string[] = [];
     let networksList: string[] = [];
 
-    // Validate specs, auto-derive secrets/networks, draft functions
+    // Validate specs via plugins, auto-derive secrets/networks, generate code
     const capabilitySpecs: CapabilitySpec[] = [];
     const draftedCapabilities: CapabilityFunction[] = [];
 
     for (const raw of rawCapabilities) {
-      const v = validateSpec(raw);
+      const pluginType = raw.type || 'api-gateway';
+      const plugin = getPlugin(pluginType);
+      if (!plugin) return res.status(400).json({ error: `Unknown capability type: ${pluginType}` });
+
+      const v = plugin.validateSpec(raw);
       if (!v.valid) return res.status(400).json({ error: `Invalid capability spec "${raw.name}": ${v.errors.join(', ')}` });
       capabilitySpecs.push(raw as CapabilitySpec);
-      for (const s of extractSecrets(raw)) { if (!secretsList.includes(s)) secretsList.push(s) }
-      for (const n of extractNetworks(raw)) { if (!networksList.includes(n)) networksList.push(n) }
-    }
+      for (const s of plugin.extractSecrets(raw)) { if (!secretsList.includes(s)) secretsList.push(s) }
+      for (const n of plugin.extractNetworks(raw)) { if (!networksList.includes(n)) networksList.push(n) }
 
-    // Draft capability functions (requires ANTHROPIC_API_KEY)
-    for (const spec of capabilitySpecs) {
-      const specH = hashSpec(spec);
+      const specH = hashSpec(raw);
       const cached = db.getCachedCapability(specH);
       let docDomain: string;
-      try { docDomain = new URL(spec.doc_url).hostname } catch { docDomain = spec.doc_url }
+      try { docDomain = new URL(raw.doc_url).hostname } catch { docDomain = raw.doc_url }
 
       if (cached) {
-        console.log(`  Capability ${spec.name}: using cached draft`);
-        draftedCapabilities.push({ name: spec.name, spec, code: cached.code, hash: hashCode(cached.code), doc_domain: docDomain });
+        console.log(`  Capability ${raw.name}: using cached`);
+        draftedCapabilities.push({ name: raw.name, spec: raw, code: cached.code, hash: hashCode(cached.code), doc_domain: docDomain, signature: cached.signature || undefined });
         continue;
       }
 
       try {
-        console.log(`  Capability ${spec.name}: fetching docs from ${spec.doc_url}`);
-        const docContent = await fetchDocContent(spec.doc_url);
-        const draft = await draftCapability(spec, docContent);
-        db.cacheCapability(specH, spec.name, spec, draft.code, docDomain);
-        draftedCapabilities.push({ name: spec.name, spec, code: draft.code, hash: draft.hash, doc_domain: docDomain });
-        console.log(`  Capability ${spec.name}: drafted (${draft.code.split('\n').length} lines)`);
+        const result = await plugin.codegen(raw);
+        db.cacheCapability(specH, raw.name, raw, result.code, docDomain, result.signature);
+        draftedCapabilities.push({ name: raw.name, spec: raw, code: result.code, hash: hashCode(result.code), doc_domain: docDomain, signature: result.signature });
+        console.log(`  Capability ${raw.name}: generated (${result.code.split('\n').length} lines)`);
       } catch (err: any) {
-        console.error(`  Capability ${spec.name}: draft failed — ${err.message}`);
-        return res.status(502).json({ error: `Failed to draft capability "${spec.name}": ${err.message}` });
+        console.error(`  Capability ${raw.name}: codegen failed — ${err.message}`);
+        return res.status(502).json({ error: `Failed to generate capability "${raw.name}": ${err.message}` });
       }
     }
 
     const requestId = `permit_${randomBytes(8).toString('hex')}`;
     const approvalToken = randomBytes(32).toString('hex');
-    const scopeData = JSON.stringify({ description, secrets: secretsList, networks: networksList, capabilities: capabilitySpecs, draftedCapabilities });
+    const tenant = (req as any).tenant as TenantContext;
+    const scopeData = JSON.stringify({ description, secrets: secretsList, networks: networksList, capabilities: capabilitySpecs, draftedCapabilities, agentId: tenant.tenant_id });
 
     db.createRequest(requestId, 'permit-request', 'scope', hashCode(scopeData), secretsList, { sessionId: permitId, description }, approvalToken);
     db.storeCode(requestId, scopeData);
@@ -408,7 +425,7 @@ app.post('/permit', requireTenant, syncTenant, async (req: Request, res: Respons
       permit_id: permitId,
       approval_url: approvalUrl,
       status_url: statusUrl,
-      capabilities_drafted: capabilitySpecs.map(s => s.name),
+      capabilities: draftedCapabilities.map(c => ({ name: c.name, signature: c.signature })),
       message: 'Permit request awaiting approval — poll status_url'
     });
   } catch (error: any) {
@@ -440,9 +457,13 @@ app.post('/execute', requireTenant, syncTenant, async (req: Request, res: Respon
     if (!actionCode) return res.status(400).json({ error: 'Missing code' });
     if (!effectivePermitId) return res.status(400).json({ error: 'Missing permit_id — request a permit first via POST /permit' });
 
+    const tenant = (req as any).tenant as TenantContext;
     const session = db.getSession(effectivePermitId);
     if (!session) return res.status(404).json({ error: 'Permit not found or expired' });
     if (!session.policy.capabilities?.length) return res.status(400).json({ error: 'Permit has no capabilities — resubmit permit with capabilities array' });
+
+    // Verify agent owns this session
+    if (session.agent_id && session.agent_id !== tenant.tenant_id) return res.status(403).json({ error: 'This permit belongs to a different agent' });
 
     const codeHash = hashCode(actionCode);
 
@@ -458,14 +479,14 @@ app.post('/execute', requireTenant, syncTenant, async (req: Request, res: Respon
     const enforcement: any = {
       mode: 'capability',
       capabilities: session.policy.capabilities.map(c => ({
-        name: c.name, doc_domain: c.doc_domain, summary: summarizeSpec(c.spec),
+        name: c.name, doc_domain: c.doc_domain, signature: c.signature,
       })),
     };
 
     db.updateRequestStatus(requestId, 'approved');
     const capDefs = session.policy.capabilities.map(c => c.code).join('\n\n');
     const execCode = capDefs + '\n\n// --- Agent code ---\n' + actionCode;
-    executeInBackground(requestId, execCode, session.policy.allowedNetworks, secretsList, args, enforcement);
+    executeInBackground(requestId, execCode, session.policy.allowedNetworks, secretsList, session.owner_id, args, enforcement);
     const statusUrl = PUBLIC_URL ? `${PUBLIC_URL}/execute/${requestId}/status?wait=true` : undefined;
     return res.json({ request_id: requestId, status: 'approved', permit_id: effectivePermitId, status_url: statusUrl, message: 'Auto-approved (capability mode)' });
   } catch (error: any) {
@@ -531,18 +552,23 @@ async function handleStatus(req: Request, res: Response) {
 }
 
 // Background execution
-async function executeInBackground(requestId: string, code: string, allowedNetworks: string[], requiredSecrets: string[], args?: Record<string, any>, enforcement?: any) {
+async function executeInBackground(requestId: string, code: string, allowedNetworks: string[], requiredSecrets: string[], ownerId: string | null, args?: Record<string, any>, enforcement?: any) {
   console.log(`\n🚀 Starting background execution for ${requestId}`);
   try {
     db.updateRequestStatus(requestId, 'executing');
     const dbRequest = db.getRequest(requestId);
     const execArgs = args || (dbRequest?.args ? JSON.parse(dbRequest.args) : {});
 
+    // Load secrets from owner's vault
+    const ownerSecrets = ownerId ? db.getSecretsByOwner(ownerId) : {};
+    // Also check legacy secrets for backward compat
+    const legacySecrets = db.getSecretsByOwner('legacy');
     const secretValues: Record<string, string> = {};
     const missingSecrets: string[] = [];
     for (const name of requiredSecrets) {
-      if (!secrets[name]) missingSecrets.push(name);
-      else secretValues[name] = secrets[name];
+      if (ownerSecrets[name]) secretValues[name] = ownerSecrets[name];
+      else if (legacySecrets[name]) secretValues[name] = legacySecrets[name];
+      else missingSecrets.push(name);
     }
 
     if (missingSecrets.length > 0) {

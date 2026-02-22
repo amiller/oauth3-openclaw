@@ -90,6 +90,40 @@ export class ProxyDatabase {
       CREATE INDEX IF NOT EXISTS idx_requests_created ON execution_requests(created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_scope_grants_session ON scope_grants(session_id);
     `);
+    this.migrate();
+  }
+
+  private migrate(): void {
+    const cols = (table: string) => {
+      const rows = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+      return new Set(rows.map(r => r.name));
+    };
+    const secretCols = cols('secrets');
+    if (!secretCols.has('owner_id')) {
+      this.db.exec(`ALTER TABLE secrets ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'legacy'`);
+      this.db.exec(`CREATE INDEX IF NOT EXISTS idx_secrets_owner ON secrets(owner_id)`);
+      // Drop old primary key constraint — recreate table with composite key
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS secrets_v2 (
+          name TEXT NOT NULL, value TEXT NOT NULL, owner_id TEXT NOT NULL DEFAULT 'legacy',
+          created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+          PRIMARY KEY (name, owner_id)
+        );
+        INSERT OR IGNORE INTO secrets_v2 SELECT name, value, owner_id, created_at, updated_at FROM secrets;
+        DROP TABLE secrets;
+        ALTER TABLE secrets_v2 RENAME TO secrets;
+        CREATE INDEX IF NOT EXISTS idx_secrets_owner ON secrets(owner_id);
+      `);
+    }
+    const capCols = cols('capabilities');
+    if (!capCols.has('signature')) {
+      this.db.exec(`ALTER TABLE capabilities ADD COLUMN signature TEXT`);
+    }
+    const sessionCols = cols('sessions');
+    if (!sessionCols.has('owner_id')) {
+      this.db.exec(`ALTER TABLE sessions ADD COLUMN owner_id TEXT`);
+      this.db.exec(`ALTER TABLE sessions ADD COLUMN agent_id TEXT`);
+    }
   }
 
   // Execution Requests
@@ -137,21 +171,26 @@ export class ProxyDatabase {
 
   // Secrets
 
-  setSecret(name: string, value: string): void {
+  setSecret(name: string, value: string, ownerId: string): void {
     const now = Date.now();
-    this.db.prepare('INSERT INTO secrets (name, value, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
-      .run(name, value, now, now);
+    this.db.prepare('INSERT INTO secrets (name, value, owner_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(name, owner_id) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
+      .run(name, value, ownerId, now, now);
   }
 
-  getAllSecrets(): Record<string, string> {
-    const rows = this.db.prepare('SELECT name, value FROM secrets').all() as { name: string; value: string }[];
+  getSecretsByOwner(ownerId: string): Record<string, string> {
+    const rows = this.db.prepare('SELECT name, value FROM secrets WHERE owner_id = ?').all(ownerId) as { name: string; value: string }[];
     const out: Record<string, string> = {};
     for (const r of rows) out[r.name] = r.value;
     return out;
   }
 
-  deleteSecret(name: string): void {
-    this.db.prepare('DELETE FROM secrets WHERE name = ?').run(name);
+  getSecretNamesByOwner(ownerId: string): string[] {
+    const rows = this.db.prepare('SELECT name FROM secrets WHERE owner_id = ?').all(ownerId) as { name: string }[];
+    return rows.map(r => r.name);
+  }
+
+  deleteSecret(name: string, ownerId: string): void {
+    this.db.prepare('DELETE FROM secrets WHERE name = ? AND owner_id = ?').run(name, ownerId);
   }
 
   // Code storage
@@ -167,14 +206,14 @@ export class ProxyDatabase {
 
   // Sessions (permits)
 
-  createSession(sessionId: string, policy: SessionPolicy): void {
+  createSession(sessionId: string, policy: SessionPolicy, agentId?: string, ownerId?: string): void {
     const now = Date.now();
-    this.db.prepare('INSERT OR REPLACE INTO sessions (session_id, created_at, last_activity, policy) VALUES (?, ?, ?, ?)')
-      .run(sessionId, now, now, JSON.stringify(policy));
+    this.db.prepare('INSERT OR REPLACE INTO sessions (session_id, created_at, last_activity, policy, agent_id, owner_id) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(sessionId, now, now, JSON.stringify(policy), agentId || null, ownerId || null);
     pgLog.logSession(sessionId, this.tenantId, policy.description);
   }
 
-  getSession(sessionId: string): { session_id: string; created_at: number; last_activity: number; policy: SessionPolicy } | undefined {
+  getSession(sessionId: string): { session_id: string; created_at: number; last_activity: number; policy: SessionPolicy; agent_id: string | null; owner_id: string | null } | undefined {
     const row = this.db.prepare('SELECT * FROM sessions WHERE session_id = ?').get(sessionId) as any;
     if (!row) return undefined;
     if (Date.now() - row.last_activity > 2 * 60 * 60 * 1000) {
@@ -195,12 +234,17 @@ export class ProxyDatabase {
   }
 
   deleteSession(sessionId: string): void {
+    this.db.prepare('DELETE FROM scope_grants WHERE session_id = ?').run(sessionId);
     this.db.prepare('DELETE FROM sessions WHERE session_id = ?').run(sessionId);
   }
 
-  listSessions(): Array<{ session_id: string; created_at: number; last_activity: number; policy: SessionPolicy }> {
+  listSessions(): Array<{ session_id: string; created_at: number; last_activity: number; policy: SessionPolicy; agent_id: string | null; owner_id: string | null }> {
     const now = Date.now();
-    this.db.prepare('DELETE FROM sessions WHERE ? - last_activity > ?').run(now, 2 * 60 * 60 * 1000);
+    const expired = this.db.prepare('SELECT session_id FROM sessions WHERE ? - last_activity > ?').all(now, 2 * 60 * 60 * 1000) as { session_id: string }[];
+    for (const e of expired) {
+      this.db.prepare('DELETE FROM scope_grants WHERE session_id = ?').run(e.session_id);
+      this.db.prepare('DELETE FROM sessions WHERE session_id = ?').run(e.session_id);
+    }
     const rows = this.db.prepare('SELECT * FROM sessions ORDER BY last_activity DESC').all() as any[];
     return rows.map(r => ({ ...r, policy: JSON.parse(r.policy) }));
   }
@@ -224,13 +268,13 @@ export class ProxyDatabase {
 
   // Capability cache
 
-  getCachedCapability(specHash: string): { code: string; name: string } | undefined {
-    return this.db.prepare('SELECT name, code FROM capabilities WHERE spec_hash = ?').get(specHash) as { name: string; code: string } | undefined;
+  getCachedCapability(specHash: string): { code: string; name: string; signature: string | null } | undefined {
+    return this.db.prepare('SELECT name, code, signature FROM capabilities WHERE spec_hash = ?').get(specHash) as { name: string; code: string; signature: string | null } | undefined;
   }
 
-  cacheCapability(specHash: string, name: string, spec: any, code: string, docDomain: string): void {
-    this.db.prepare('INSERT OR REPLACE INTO capabilities (spec_hash, name, spec, code, doc_domain, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(specHash, name, JSON.stringify(spec), code, docDomain, Date.now());
+  cacheCapability(specHash: string, name: string, spec: any, code: string, docDomain: string, signature?: string): void {
+    this.db.prepare('INSERT OR REPLACE INTO capabilities (spec_hash, name, spec, code, doc_domain, created_at, signature) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(specHash, name, JSON.stringify(spec), code, docDomain, Date.now(), signature || null);
   }
 
   listRecentRequests(limit = 20): ExecutionRecord[] {

@@ -8,6 +8,7 @@ const API_BEARER_TOKEN = process.env.API_BEARER_TOKEN || ''
 
 export interface TenantContext {
   tenant_id: string
+  role: 'agent' | 'owner'
   plan?: string
   iat: number
   exp: number
@@ -56,8 +57,8 @@ function getSecret(): string {
   return localSecret
 }
 
-export function issueToken(tenantId: string, plan = 'free'): string {
-  return signJWT({ tenant_id: tenantId, plan }, getSecret())
+export function issueToken(tenantId: string, role: 'agent' | 'owner' = 'agent', plan = 'free'): string {
+  return signJWT({ tenant_id: tenantId, role, plan }, getSecret())
 }
 
 // --- Express middleware ---
@@ -67,7 +68,7 @@ export function requireTenant(req: Request, res: Response, next: NextFunction) {
   if (!auth) {
     // Dev fallback: no auth configured = open access
     if (!JWT_SECRET && !API_BEARER_TOKEN) {
-      ;(req as any).tenant = { tenant_id: 'dev', plan: 'free', iat: 0, exp: Infinity }
+      ;(req as any).tenant = { tenant_id: 'dev', role: 'owner' as const, plan: 'free', iat: 0, exp: Infinity }
       return next()
     }
     return res.status(401).json({ error: 'Missing Authorization header' })
@@ -78,13 +79,14 @@ export function requireTenant(req: Request, res: Response, next: NextFunction) {
   // Try JWT first
   const tenant = verifyJWT(token, getSecret())
   if (tenant) {
+    if (!tenant.role) tenant.role = 'agent' // legacy tokens default to agent
     ;(req as any).tenant = tenant
     return next()
   }
 
   // Fallback: legacy bearer token (backwards compat during migration)
   if (API_BEARER_TOKEN && token === API_BEARER_TOKEN) {
-    ;(req as any).tenant = { tenant_id: req.headers['x-tenant-id'] as string || 'legacy', plan: 'free', iat: 0, exp: Infinity }
+    ;(req as any).tenant = { tenant_id: req.headers['x-tenant-id'] as string || 'legacy', role: 'agent' as const, plan: 'free', iat: 0, exp: Infinity }
     return next()
   }
 
@@ -92,9 +94,22 @@ export function requireTenant(req: Request, res: Response, next: NextFunction) {
 }
 
 // Signup — enclave always issues tokens directly
+export function requireOwner(req: Request, res: Response, next: NextFunction) {
+  const tenant = (req as any).tenant as TenantContext | undefined
+  if (!tenant || tenant.role !== 'owner') return res.status(403).json({ error: 'Owner role required' })
+  next()
+}
+
 export function handleSignup(req: Request, res: Response) {
-  const { name } = req.body || {}
+  const { name, role } = req.body || {}
+  const effectiveRole = role === 'owner' ? 'owner' : 'agent'
   const tenantId = `tenant_${randomBytes(8).toString('hex')}`
-  const token = issueToken(tenantId)
-  res.json({ tenant_id: tenantId, token, message: 'Store this token — it cannot be recovered' })
+  const token = issueToken(tenantId, effectiveRole)
+  res.json({ tenant_id: tenantId, role: effectiveRole, token, message: 'Store this token — it cannot be recovered' })
+}
+
+export function verifyTokenDirect(token: string): TenantContext | null {
+  const tenant = verifyJWT(token, getSecret())
+  if (tenant && !tenant.role) tenant.role = 'agent'
+  return tenant
 }
