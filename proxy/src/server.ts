@@ -92,23 +92,35 @@ Use on all requests: \`Authorization: Bearer <token>\`
 
 ## Quick Start
 
-1. \`POST /signup\` to get a token
-2. \`POST /permit\` with \`capabilities\` array → get \`approval_url\`, \`permit_id\`, \`status_url\`
-3. **Poll \`status_url\`** (long-poll, blocks up to 120s) — wait until status is \`"completed"\` (approved)
-4. \`POST /execute\` with \`{ action_id, code, args, permit_id }\` → get \`status_url\`
-5. **Poll \`status_url\`** again — wait until execution finishes
+Both \`/permit\` and \`/execute\` are **async** — they return a \`status_url\` you must poll. The pattern is identical for both:
+
+\`\`\`
+request  → { ..., status_url }
+fetch(status_url)  → blocks up to 120s → { status, result? }
+\`\`\`
+
+### Full flow:
+
+1. \`POST /signup\` → get token
+2. \`POST /permit\` with capabilities → get \`status_url\`, \`approval_url\`, \`permit_id\`
+3. **Poll \`status_url\`** — blocks until human approves (or denies)
+4. \`POST /execute\` with code + args + permit_id → get **new \`status_url\`**
+5. **Poll that \`status_url\`** — blocks until execution finishes and returns \`result\`
+
+**Both steps 3 and 5 require polling.** Execution is NOT synchronous — the \`/execute\` response does NOT contain the result. You MUST poll the returned \`status_url\` to get \`result.stdout\`, \`result.success\`, etc.
 
 \`\`\`
 POST /permit  → { status: "pending_permit", approval_url, permit_id, status_url }
-GET  status_url?wait=true  → blocks until → { status: "completed", permit_id }
+GET  status_url  → blocks → { status: "completed", permit_id }
+
 POST /execute → { status: "approved", request_id, status_url }
-GET  status_url?wait=true  → blocks until → { status: "completed", result: {...} }
+GET  status_url  → blocks → { status: "completed", result: { success, stdout, stderr, ... } }
 \`\`\`
 
 **IMPORTANT**:
-- Always use the \`status_url\` from the response to poll — it already includes \`?wait=true\`. Do NOT append query params.
-- Do NOT poll \`/sessions/:id\` — that returns permit policy, not approval status.
-- \`status_url\` long-polls (blocks up to 120s). Just \`fetch(status_url)\` in a loop.
+- \`status_url\` already includes \`?wait=true\`. Do NOT append query params.
+- \`status_url\` long-polls (blocks up to 120s). Just \`fetch(status_url)\` in a loop until status is terminal.
+- Terminal statuses: \`completed\`, \`failed\`, \`denied\`.
 
 ## Endpoints
 
