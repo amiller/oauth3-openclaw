@@ -71,24 +71,20 @@ function secrets(spec: TiktokHistorySpec): string[] {
 function networks(): string[] { return ['www.tiktok.com'] }
 
 function summarize(spec: TiktokHistorySpec): string {
-  return `TikTok watch history via ${spec.cookie_secret} — GET /tiktok/watch/history/list/v1/ — docs: ${spec.doc_url}`
+  return `TikTok watch history — cookies: ${spec.cookie_secret}`
 }
 
 function codegen(spec: TiktokHistorySpec): Promise<PluginCodegenResult> {
-  const signature = 'async function fetchHistory(count: string, max_cursor?: string): Promise<{videos: any[], has_more: boolean, next_cursor: string}>'
+  const fnName = spec.name.split('.').pop()!
+  const signature = `async function ${fnName}(count: string, max_cursor?: string): Promise<{videos: any[], has_more: boolean, next_cursor: string}>`
 
   const code = [
     `${signature} {`,
-    `  // Host endowment handles: cookie parsing, X-Bogus generation, device fingerprinting`,
-    `  // Endpoint: GET https://www.tiktok.com/tiktok/watch/history/list/v1/`,
-    `  // Required params: aid=1180, scene=1, device fingerprint, X-Bogus`,
-    `  // Cookies: from ${spec.cookie_secret} (sessionid required)`,
-    spec.proxy_url_secret ? `  // Proxy: via ${spec.proxy_url_secret}` : null,
     `  // count: 1-20 videos per page`,
-    `  // max_cursor: pagination token from previous response (omit for first page)`,
-    `  // Returns: { videos: aweme_list[], has_more: boolean, next_cursor: string }`,
+    `  // max_cursor: pass next_cursor from previous response to get next page (omit for first page)`,
+    `  // Returns: { videos: [...], has_more: boolean, next_cursor: string }`,
     `}`,
-  ].filter(Boolean).join('\n')
+  ].join('\n')
 
   const endowment: EndowmentFactory = {
     build(secretsMap: Record<string, string>) {
@@ -153,6 +149,20 @@ function codegen(spec: TiktokHistorySpec): Promise<PluginCodegenResult> {
 
 export const tiktokHistoryPlugin: CapabilityPlugin = {
   type: 'tiktok-history',
+  describe: () => ({
+    type: 'tiktok-history',
+    description: 'Fetch TikTok watch history. Returns paginated list of watched videos.',
+    spec_schema: {
+      type: '"tiktok-history"', name: 'string', doc_url: 'string',
+      cookie_secret: 'string (name of stored cookie secret, e.g. COOKIES_TIKTOK_COM)',
+      proxy_url_secret: 'string (optional, SOCKS5 proxy secret name)',
+    },
+    example_spec: {
+      type: 'tiktok-history', name: 'tiktok.watchHistory',
+      doc_url: 'https://www.tiktok.com/tpp/watch-history',
+      cookie_secret: 'COOKIES_TIKTOK_COM',
+    },
+  }),
   validateSpec: validate,
   extractSecrets: secrets,
   extractNetworks: networks,

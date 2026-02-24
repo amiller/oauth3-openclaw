@@ -168,6 +168,22 @@ function codegen(spec: ApiGatewaySpec): Promise<PluginCodegenResult> {
 
 export const apiGatewayPlugin: CapabilityPlugin = {
   type: 'api-gateway',
+  describe: () => ({
+    type: 'api-gateway',
+    description: 'DEPRECATED — use scoped-fetch instead. Single-endpoint HTTP proxy with param constraints.',
+    spec_schema: {
+      type: '"api-gateway"', name: 'string', doc_url: 'string', endpoint: 'string (URL template with {placeholders})',
+      method: 'GET|POST|PUT|DELETE|PATCH',
+      auth: '{ header: string, value: string (use {SECRET_NAME} for secret refs) } (optional)',
+      params: 'Record<name, { in: "path"|"body"|"query", constraint?: { type, pattern?, op?, value?, rationale } }>',
+    },
+    example_spec: {
+      type: 'api-gateway', name: 'github-list-issues', doc_url: 'https://docs.github.com/en/rest/issues',
+      endpoint: 'https://api.github.com/repos/{owner}/{repo}/issues',
+      method: 'GET', auth: { header: 'Authorization', value: 'Bearer {GITHUB_TOKEN}' },
+      params: { owner: { in: 'path' }, repo: { in: 'path' }, state: { in: 'query' } },
+    },
+  }),
   validateSpec: validate,
   extractSecrets: secrets,
   extractNetworks: networks,

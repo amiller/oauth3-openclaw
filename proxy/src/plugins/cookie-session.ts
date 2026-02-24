@@ -178,6 +178,24 @@ function codegen(spec: CookieSessionSpec): Promise<PluginCodegenResult> {
 
 export const cookieSessionPlugin: CapabilityPlugin = {
   type: 'cookie-session',
+  describe: () => ({
+    type: 'cookie-session',
+    description: 'DEPRECATED — use scoped-fetch with cookie_secret instead. Single-endpoint cookie-auth proxy.',
+    spec_schema: {
+      type: '"cookie-session"', name: 'string', doc_url: 'string',
+      cookie_secret: 'string (name of stored cookie secret)',
+      endpoint: 'string (URL template)', method: 'GET|POST|PUT|DELETE',
+      params: 'Record<name, { in: "path"|"body"|"query" }>',
+      extra_headers: 'Record<string,string> (optional)',
+    },
+    example_spec: {
+      type: 'cookie-session', name: 'reddit-saved',
+      doc_url: 'https://www.reddit.com/dev/api/',
+      cookie_secret: 'COOKIES_REDDIT_COM',
+      endpoint: 'https://www.reddit.com/user/{username}/saved.json',
+      method: 'GET', params: { username: { in: 'path' }, limit: { in: 'query' } },
+    },
+  }),
   validateSpec: validate,
   extractSecrets: secrets,
   extractNetworks: networks,

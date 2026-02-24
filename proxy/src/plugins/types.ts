@@ -10,8 +10,16 @@ export interface PluginCodegenResult {
   endowment: EndowmentFactory
 }
 
+export interface PluginDescriptor {
+  type: string
+  description: string
+  spec_schema: Record<string, any>
+  example_spec: Record<string, any>
+}
+
 export interface CapabilityPlugin {
   type: string
+  describe(): PluginDescriptor
   validateSpec(spec: any): { valid: boolean; errors: string[] }
   extractSecrets(spec: any): string[]
   extractNetworks(spec: any): string[]
