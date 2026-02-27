@@ -23,7 +23,7 @@ function b64urlDecode(s: string): string {
   return Buffer.from(s, 'base64url').toString()
 }
 
-function signJWT(payload: object, secret: string, expiresIn = 86400): string {
+function signJWT(payload: object, secret: string, expiresIn = 0): string {
   const header = b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))
   const now = Math.floor(Date.now() / 1000)
   const body = b64url(JSON.stringify({ ...payload, iat: now, exp: now + expiresIn }))
