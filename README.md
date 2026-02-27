@@ -19,11 +19,21 @@ Agent                                 TEE (Confidential VM)
 
 Because code review doesn't help when the code was influenced by prompt injection. The key insight: **the capability function is written before any untrusted data enters the system.** The agent submits a rigid JSON spec, Haiku drafts a 5-line fetch wrapper from authoritative API docs, and the human approves it — all before the agent processes any external content. Injected instructions can't change the approved capability; they can only affect data flowing through it, inside the sandbox.
 
-This is the same architectural principle as [Conseca](https://arxiv.org/abs/2506.08800) (Google, HotOS 2025) — separate trusted policy generation from untrusted execution — but OAuth3 generates **code that IS the action** rather than abstract policies that future actions are checked against. A 10-line scoped fetch function is easier to evaluate than "agent may access GitHub API with read scope." OAuth3 also adds TEE credential custody and session learning (approve once, reuse across a session) that Conseca identifies as future work.
+### Open integration surface
+
+Most agent security frameworks assume a **fixed set of tools** — the agent picks from `send_email`, `read_file`, `query_db`, and the security system gates access to that known set. This is true of [Conseca](https://arxiv.org/abs/2501.17070) (Google, HotOS 2025), [Progent](https://arxiv.org/abs/2504.11703), [SEAgent](https://arxiv.org/abs/2601.11893), [MiniScope](https://arxiv.org/abs/2512.11147), [AgentArmor](https://arxiv.org/abs/2508.01249), and others. Their policy languages — whether regex, DSL, or LLM-generated — reference specific tools and endpoints known at policy-definition time.
+
+OAuth3 doesn't require a predefined tool registry. An agent can propose a novel integration with any HTTP API, and the system handles it: the agent submits a capability spec, the enclave's LLM drafts scoped code from API docs, a human reviews the concrete function, and it runs sandboxed. The set of possible integrations is open-ended — bounded only by what a human is willing to approve.
+
+This also addresses the main critiques the field levels at Conseca's approach:
+- **"Regex policies can't handle complex attacks"** ([ControlValve](https://arxiv.org/abs/2510.17276)) — OAuth3 generates executable code, not regex patterns
+- **"LLM-generated policies are unreliable"** ([MiniScope](https://arxiv.org/abs/2512.11147), [CSAgent](https://arxiv.org/abs/2509.22256)) — the LLM drafts code that a human reviews and that compiles to deterministic constraints; no LLM in the enforcement path
+- **"Domain-specific rules limit open-domain use"** ([PSG-Agent](https://arxiv.org/abs/2509.23614)) — capabilities are generated per-task, not predefined per-domain
 
 ### What's unique
 
-- **No server changes** — works with any existing API. The enclave holds real credentials and proxies requests.
+- **Open integration surface** — works with any HTTP API without predefined tool definitions. Agents propose novel integrations; humans approve concrete code.
+- **No server changes** — the enclave holds real credentials and proxies requests. To external services it looks like a normal user session.
 - **Credential custody in hardware** — secrets live inside a TEE (dstack CVM). Remote attestation proves what code is running.
 - **Capability-based sandbox** — agent code gets named functions (`github()`, `slack()`), not raw `fetch()`. Each function is locked to specific URL patterns, methods, and body fields.
 - **Account encumbrance** — the password can be rotated *inside* the TEE so even the user can't bypass policies without visibly destroying the encumbrance. Enables DAO-controlled accounts, mandatory CI gates, escrow delegation.
