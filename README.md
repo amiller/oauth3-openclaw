@@ -1,106 +1,130 @@
-# OAuth3 Proxy
+# OAuth3 Enclave
 
-**Your agent's keys don't belong on your agent's machine.**
+An API gateway where every integration is defined just-in-time. There's no fixed set of tools — an agent states its **intent** (a goal, API doc URLs, and which secrets it needs), a trusted LLM inside the enclave drafts a minimal scoped-fetch spec from only that trusted context, a human approves the intent, and the spec compiles into a deterministic sandbox. Credentials never leave the TEE. The agent never sees them.
 
-OAuth3 Proxy runs inside a TEE (Trusted Execution Environment) and holds API keys on behalf of AI agents. When an agent needs to use a key — call the GitHub API, post to Slack, sign a transaction — it submits code to the proxy. A human approves (or the session policy auto-approves), the code runs inside the enclave with the key injected, and only the result comes back. The key never touches the agent's host.
+This is the [Conseca](https://arxiv.org/abs/2501.17070) architecture (Google, HotOS 2025) made concrete: separate trusted policy generation from untrusted execution. The LLM drafts policy using **only trusted inputs** (the intent spec + authoritative API docs). The policy compiles to a locked-down fetch function — specific URL globs, HTTP methods, body fields, rate limits. No LLM in the enforcement path. No predefined tool registry. No server-side changes.
 
 ```
-Your machine                          TEE (dstack CVM)
-┌──────────┐                    ┌──────────────────────┐
-│  Agent   │── POST /execute ──►│  OAuth3 Proxy        │
-│          │◄─ result ──────────│  ├─ holds your keys   │
-└──────────┘                    │  ├─ runs code in Deno │
-                                │  └─ Haiku reviews it  │
-┌──────────┐                    │                      │
-│  You     │── approve via ────►│  approval page       │
-│ (browser)│   TEE HTTPS        │  dashboard           │
-└──────────┘                    └──────────────────────┘
+  Agent                    Human                    TEE (Confidential VM)
+┌─────────┐            ┌───────────┐          ┌──────────────────────────────┐
+│         │── intent ──►           │          │                              │
+│         │  name       │ reviews  │─approve─►│ LLM drafts scoped-fetch spec │
+│         │  goal       │ the      │          │ from intent + API docs only   │
+│         │  doc_urls   │ intent   │          │ (no untrusted input)          │
+│         │  secrets    │          │          │                              │
+│         │             └───────────┘          │ spec compiles to:            │
+│         │                                   │  URL globs, methods,         │
+│         │                                   │  body schema, rate limits    │
+│         │                                   │                              │
+│         │──── orchestration code ──────────►│ runs in SES sandbox          │
+│         │                                   │ github('GET', '/repos/...')   │
+│         │◄──── result ─────────────────────│ credentials injected by TEE  │
+└─────────┘                                   └──────────────────────────────┘
+
+  untrusted ▲                                   trusted ▲
+  prompt injection can't                        attested, deterministic
+  change the approved spec                      no LLM at enforcement time
 ```
 
-## Why
+### Intent, not code review
 
-AI agents are gaining tool-use capabilities fast. The bottleneck is trust: if you give an agent your GitHub token, it can do *anything* with that token. OAuth scopes are too coarse. Revoking access requires rotating the key.
+The human approves a **goal** — "create issues on owner/repo using the GitHub API" — not a page of code. The trusted LLM inside the enclave translates that into a scoped-fetch spec: which base URL, which path globs, which HTTP methods, which body fields, which secrets to inject. That spec is the policy. It compiles to a sandbox function that can't do anything outside its scope.
 
-This proxy inverts the model. Instead of delegating a key, you delegate *specific operations*. The agent writes code describing what it wants to do, an LLM reviews the code against natural-language constraints you set, and execution happens in a sandbox you never gave the key to.
+An intent looks like:
+```json
+{
+  "name": "github",
+  "goal": "Create issues on owner/repo",
+  "doc_urls": ["https://docs.github.com/en/rest/issues"],
+  "secret_hints": ["GITHUB_TOKEN"]
+}
+```
 
-It's like `sudo` for AI agents, where the TEE is the trusted kernel.
+The LLM drafts this into a scoped-fetch spec — locked to `POST /repos/owner/repo/issues`, with `Authorization: Bearer {GITHUB_TOKEN}` injected, body restricted to `title` and `body` fields, rate-limited. That's what runs. Nothing else exists in the sandbox.
 
-## How it works
+### Why this matters
 
-1. **Agent submits code** — `POST /execute` with inline TypeScript
-2. **Three-layer review** — Haiku analyzes the code (cached), checks constraints, reviews runtime args
-3. **Human approves** (or session auto-approves) — web page served from the TEE
-4. **Code runs in Deno sandbox** — secrets injected as env vars, network restricted
-5. **Result returned** — agent long-polls `/execute/:id/status?wait=true`
+Every other agent security framework assumes the set of integrations is **known in advance**. [Progent](https://arxiv.org/abs/2504.11703), [SEAgent](https://arxiv.org/abs/2601.11893), [MiniScope](https://arxiv.org/abs/2512.11147), [AgentArmor](https://arxiv.org/abs/2508.01249) — they all gate access to predefined tools. Their policy languages (regex, DSL, Cedar) reference specific tool names and endpoints. This works for closed systems, but agents operating in the real world need to hit APIs nobody anticipated at design time.
 
-Sessions remember your approvals. After you approve a scope ("this agent can read/write issues on repo X"), subsequent matching operations auto-approve without prompting.
+OAuth3 is open-ended: the agent proposes an intent, the human approves a goal, the enclave enforces a spec. The set of possible integrations is unbounded — limited only by what a human is willing to approve.
 
-## Deploy on dstack
+This sidesteps the main critiques the field levels at contextual policy generation:
+- **"Regex policies can't handle complex attacks"** ([ControlValve](https://arxiv.org/abs/2510.17276)) — the spec compiles to URL globs + method + body schema, enforced deterministically
+- **"LLM-generated policies are unreliable"** ([MiniScope](https://arxiv.org/abs/2512.11147), [CSAgent](https://arxiv.org/abs/2509.22256)) — the LLM only drafts from trusted context; a human approves; enforcement has no LLM
+- **"Domain-specific rules can't cover open-domain tasks"** ([PSG-Agent](https://arxiv.org/abs/2509.23614)) — intents are generated per-task for any API
 
-Requires [dstack](https://github.com/aspect-build/dstack) (Phala CVM or any TEE-capable host).
+### Features
+
+- **Open integration surface** — any HTTP API, no predefined tools. Agents propose intents; the enclave drafts specs.
+- **Credential custody in hardware** — secrets live in a TEE (dstack CVM). Remote attestation proves what code runs.
+- **No server changes** — to external services it looks like a normal user session.
+- **Deterministic sandbox** — each approved spec compiles to a named function locked to specific URL globs, methods, body fields, and rate limits. No `fetch()`, no escape.
+- **Account encumbrance** — the password can be rotated *inside* the TEE so even the user can't bypass policies without visibly destroying the encumbrance.
+
+## Quick start
 
 ```bash
-# 1. Clone
-git clone https://github.com/amiller/oauth3-openclaw && cd oauth3-openclaw
-
-# 2. Configure
-cp deploy/.env.example deploy/.env
-# Edit deploy/.env — set ANTHROPIC_API_KEY, API_BEARER_TOKEN, and any secrets
-
-# 3. Build and push the proxy image
-docker build -t ghcr.io/YOUR_USER/oauth3-proxy:latest -f proxy/Dockerfile proxy/
-docker push ghcr.io/YOUR_USER/oauth3-proxy:latest
-
-# 4. Update the image digest in deploy/docker-compose.yml
-
-# 5. Deploy to your CVM
-phala deploy --cvm-id <VM_UUID> -c deploy/docker-compose.yml -e deploy/.env --wait
+cd proxy && npm install && npm run dev
 ```
 
-The proxy starts on port 3737. Your agent talks to it over the internal Docker network; the approval UI is exposed over dstack's HTTPS endpoint.
-
-## Agent integration
-
-Once deployed, the proxy serves its own protocol docs at `GET /`. Point your agent there and it knows how to use it. The short version:
+Zero config for local dev — JWT secrets auto-generate, SQLite is embedded. Set `ANTHROPIC_API_KEY` in `.env` for LLM-drafted capabilities.
 
 ```bash
-# Submit code for execution
-curl -X POST https://your-cvm-url/execute \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"skill_code": "const resp = await fetch(\"https://api.github.com/repos/you/repo/issues\", { headers: { Authorization: \"Bearer \" + Deno.env.get(\"GITHUB_TOKEN\") }}); console.log(JSON.stringify(await resp.json()));"}'
+AGENT=$(curl -s -X POST localhost:3737/signup -H 'Content-Type: application/json' \
+  -d '{"name":"my-agent"}' | jq -r .token)
+OWNER=$(curl -s -X POST localhost:3737/signup -H 'Content-Type: application/json' \
+  -d '{"name":"me","role":"owner"}' | jq -r .token)
 
-# Long-poll for result (blocks up to 120s)
-curl https://your-cvm-url/execute/REQ_ID/status?wait=true \
-  -H "Authorization: Bearer $TOKEN"
+# Store a secret
+curl -s -X POST localhost:3737/secrets \
+  -H "Authorization: Bearer $OWNER" -H 'Content-Type: application/json' \
+  -d '{"name":"GITHUB_TOKEN","value":"ghp_..."}'
+
+# Request a permit via intent (LLM drafts the scoped-fetch spec)
+PERMIT=$(curl -s -X POST localhost:3737/permit \
+  -H "Authorization: Bearer $AGENT" -H 'Content-Type: application/json' \
+  -d '{
+    "description": "List GitHub issues",
+    "intent": [{
+      "name": "github",
+      "goal": "List issues on owner/repo",
+      "doc_urls": ["https://docs.github.com/en/rest/issues"],
+      "secret_hints": ["GITHUB_TOKEN"]
+    }]
+  }')
+REQ_ID=$(echo $PERMIT | jq -r .request_id)
+PERMIT_ID=$(echo $PERMIT | jq -r .permit_id)
+
+# Approve (in production this is a browser UI)
+curl -s -X POST localhost:3737/approve/$REQ_ID \
+  -H 'Content-Type: application/json' \
+  -d "{\"owner_token\":\"$OWNER\",\"action\":\"approve\"}"
+
+# Execute
+EXEC=$(curl -s -X POST localhost:3737/execute \
+  -H "Authorization: Bearer $AGENT" -H 'Content-Type: application/json' \
+  -d "{\"permit_id\":\"$PERMIT_ID\",\"action_id\":\"list-issues\",
+       \"code\":\"const r = await github('GET','/repos/owner/repo/issues'); console.log(JSON.stringify(r));\"}")
+
+# Poll for result
+curl -s "localhost:3737/execute/$(echo $EXEC | jq -r .request_id)/status?wait=true" | jq .result
 ```
 
-For repeated operations, use scopes (`POST /scope`) to set up a session with constraints like "can only read issues on repo X" — then executions matching those constraints auto-approve.
-
-## What this is and isn't
-
-**This is** a working prototype of TEE-based key custody for AI agents. It's useful today if you run dstack and want to give an agent scoped access to your API keys without handing them over.
-
-**This isn't** a production multi-tenant service (yet). Right now it's single-user, single-TEE. The [hosted multi-tenant version](docs/prd-your-shell-or-mine.md) where one TEE serves many users is the eventual product direction.
-
-**Open questions:**
-- How should agents discover and negotiate with proxies? ([GNAP positioning](docs/gnap-positioning.md))
-- Haiku is inconsistent at gating destructive operations even when the scope explicitly allows them ([#9](https://github.com/amiller/oauth3-openclaw/issues/9))
-- Should code review be separated from arg review for cacheability? (Done — [#14](https://github.com/amiller/oauth3-openclaw/issues/14))
+See [DEPLOY.md](dstack/DEPLOY.md) for TEE deployment on dstack/Phala CVM.
 
 ## Project structure
 
 ```
 proxy/src/
-├── server.ts      # Routes, approval pages, dashboard
-├── analyzer.ts    # Three-layer Haiku review
-├── executor.ts    # Deno sandbox execution (Docker or direct mode)
-├── database.ts    # SQLite (sessions, executions, secrets)
-├── telegram.ts    # Optional Telegram notifications
-└── types.ts       # TypeScript types
-deploy/
-├── docker-compose.yml  # CVM deployment config
-└── .env                # Secrets (not committed)
+├── server.ts           # HTTP API + intent drafting
+├── executor.ts         # SES Compartment sandbox
+├── database.ts         # SQLite (dev) / Postgres (prod)
+├── auth.ts             # JWT with agent/owner roles
+└── plugins/
+    └── scoped-fetch.ts # URL globs, methods, body schema, rate limits
+dstack/
+├── docker-compose.yml  # CVM deployment
+└── .env.staging        # Env template
 ```
 
 ## License

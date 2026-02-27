@@ -1,12 +1,25 @@
 import { PolicyConstraint } from '../capability.js'
 
+export interface EndowmentFactory {
+  build(secrets: Record<string, string>): (...args: any[]) => Promise<any>
+}
+
 export interface PluginCodegenResult {
   code: string
   signature: string
+  endowment: EndowmentFactory
+}
+
+export interface PluginDescriptor {
+  type: string
+  description: string
+  spec_schema: Record<string, any>
+  example_spec: Record<string, any>
 }
 
 export interface CapabilityPlugin {
   type: string
+  describe(): PluginDescriptor
   validateSpec(spec: any): { valid: boolean; errors: string[] }
   extractSecrets(spec: any): string[]
   extractNetworks(spec: any): string[]
@@ -30,5 +43,5 @@ export interface ApiGatewaySpec extends PluginSpec {
   params: Record<string, { in: 'path' | 'body' | 'query'; constraint?: PolicyConstraint }>
   rpc_method?: string
   rpc_wrap?: boolean
-  response?: 'json' | 'text'
+  response?: 'json' | 'text' | 'binary'
 }

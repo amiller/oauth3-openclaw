@@ -22,13 +22,12 @@ services:
     restart: unless-stopped
 
   oauth3-proxy:
-    image: ghcr.io/amiller/oauth3-proxy@sha256:e07fe9de6e3fe4fc7273a6ba64f1ebaf5392b51db12863e102bb9eac4092d2a9
+    image: ghcr.io/amiller/oauth3-proxy@sha256:ffabcb2adbde3912be9ec97da4b2ad0501827ea0041a4bc6513f38125e16757a
     ports:
       - "3737:3737"
     environment:
       PORT: "3737"
       DB_PATH: /data/proxy.db
-      EXECUTOR_MODE: direct
       DATABASE_URL: postgres://${PG_USER:-oauth3}:${PG_PASSWORD}@postgres:5432/${PG_DB:-oauth3}
       CORS_ORIGIN: ${CORS_ORIGIN}
       JWT_SECRET: ${JWT_SECRET:-}

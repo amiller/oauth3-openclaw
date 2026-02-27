@@ -11,3 +11,6 @@ npm-debug.log*
 deploy/
 references/
 .vercel
+.claude/
+dstack/.env
+dstack/AGENT_*.md

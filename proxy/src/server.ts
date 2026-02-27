@@ -3,11 +3,12 @@
  * Capabilities-only execution path: permit → action
  */
 
+import './ses-init.js';
 import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import { ProxyDatabase, SessionPolicy } from './database.js';
-import { execute, hashCode, EXECUTOR_MODE } from './executor.js';
-import { CapabilitySpec, CapabilityFunction, hashSpec, tokenUsage, getPlugin } from './capability.js';
+import { execute, hashCode } from './executor.js';
+import { CapabilitySpec, CapabilityFunction, hashSpec, tokenUsage, getPlugin, allPlugins } from './capability.js';
 import { requireTenant, requireOwner, handleSignup, TenantContext, verifyTokenDirect } from './auth.js';
 import * as pgLog from './postgres.js';
 import { randomBytes } from 'crypto';
@@ -55,7 +56,7 @@ function buildApprovalUrl(requestId: string, approvalToken: string, req: any): s
 const db = new ProxyDatabase(DB_PATH);
 
 // Helper: reconstruct permit request data from DB
-function getPermitRequest(requestId: string): { permitId: string; description: string; secrets: string[]; networks: string[]; capabilities?: CapabilitySpec[]; draftedCapabilities?: CapabilityFunction[]; agentId?: string } | null {
+function getPermitRequest(requestId: string): { permitId: string; description: string; secrets: string[]; networks: string[]; capabilities?: CapabilitySpec[]; draftedCapabilities?: CapabilityFunction[]; agentId?: string; intent?: any[] } | null {
   const request = db.getRequest(requestId);
   if (!request || request.skill_url !== 'scope') return null;
   try {
@@ -63,101 +64,42 @@ function getPermitRequest(requestId: string): { permitId: string; description: s
     if (!code) return null;
     const data = JSON.parse(code);
     const args = request.args ? JSON.parse(request.args) : {};
-    return { permitId: args.sessionId || '', description: data.description || '', secrets: data.secrets || [], networks: data.networks || [], capabilities: data.capabilities, draftedCapabilities: data.draftedCapabilities, agentId: data.agentId };
+    return { permitId: args.sessionId || '', description: data.description || '', secrets: data.secrets || [], networks: data.networks || [], capabilities: data.capabilities, draftedCapabilities: data.draftedCapabilities, agentId: data.agentId, intent: data.intent };
   } catch { return null; }
 }
 
 // Discovery
 app.get('/', (_req: Request, res: Response) => {
-  res.type('text/markdown').send(`# OAuth3 Execution Proxy
+  const orchUrl = ORCHESTRATOR_URL || undefined;
+  res.json({
+    name: 'oauth3-tee',
+    description: 'TEE-sandboxed code execution with human-approved capabilities',
+    docs: orchUrl ? `${orchUrl}/tee-docs` : 'See orchestrator /tee-docs for full documentation',
+    important: 'Read docs URL above before making API calls.',
+    quick_start: {
+      '1_signup': 'POST /signup {name: "my-agent"} → {token}',
+      '2_permit': 'POST /permit {description: "...", intent: [{name: "github", goal: "Create issues on owner/repo", doc_urls: ["https://docs.github.com/en/rest/issues"], secret_hints: ["GITHUB_TOKEN"]}]} → {approval_url, status_url, permit_id}',
+      '3_wait': 'Present approval_url to human, poll status_url until status=completed',
+      '4_execute': 'POST /execute {permit_id, action_id: "do-thing", code: "const r = await github(\'GET\', \'/repos/o/r/issues\'); console.log(JSON.stringify(r));"}',
+    },
+    available_plugins: allPlugins().map(p => ({ type: p.type, description: p.describe().description })),
+    endpoints: {
+      signup: 'POST /signup',
+      plugins: 'GET /plugins',
+      permit: 'POST /permit — send intent[] for LLM-drafted policy (recommended) or capabilities[] for direct specs',
+      draft: 'POST /draft — preview LLM-drafted policy without creating permit',
+      execute: 'POST /execute',
+      status: 'GET /execute/:id/status?wait=true',
+      sessions: 'GET /sessions',
+      secrets: 'POST /secrets',
+      health: 'GET /health',
+    },
+    public_url: PUBLIC_URL || undefined,
+  });
+});
 
-TEE-sandboxed code execution with human-approved permits.
-Your code runs in a Deno sandbox with access to secrets you don't hold directly.
-
-## How It Works
-
-1. **Request a permit** — describe what capabilities you need (API endpoints, secrets, networks).
-2. **Human approves the permit** — they see the capability specs, not your code.
-3. **Submit actions** under the permit — code + args, verified programmatically.
-4. **System enforces** — AST static analysis checks your code only calls declared capabilities.
-
-## Authentication
-
-\`\`\`
-POST /signup  {"name": "my-agent"}
-→ { "tenant_id": "...", "token": "..." }
-\`\`\`
-
-Use on all requests: \`Authorization: Bearer <token>\`
-
-## Quick Start
-
-1. \`POST /signup\` to get a token
-2. \`POST /permit\` with \`capabilities\` array → get \`approval_url\` + \`permit_id\`
-3. Human approves at \`approval_url\`
-4. \`POST /execute\` with \`{ action_id, code, args, permit_id }\` → auto-verified and executed
-5. \`GET /execute/:id/status?wait=true\` → long-poll for result
-
-\`\`\`
-POST /permit  → { status: "pending_permit", approval_url, permit_id }
-# Human approves
-POST /execute → { status: "approved", request_id }
-GET  /execute/:id/status?wait=true → { status: "completed", result: {...} }
-\`\`\`
-
-## Endpoints
-
-### POST /permit — Request a Permit
-
-\`\`\`json
-{
-  "description": "File issues on GitHub",
-  "capabilities": [
-    {
-      "name": "github.createIssue",
-      "doc_url": "https://docs.github.com/en/rest/issues/issues#create-an-issue",
-      "endpoint": "https://api.github.com/repos/{owner}/{repo}/issues",
-      "method": "POST",
-      "auth": { "header": "Authorization", "value": "token {GH_TOKEN}" },
-      "params": {
-        "owner": { "in": "path", "constraint": { "type": "regex", "param": "owner", "pattern": "^amiller$", "rationale": "Only amiller repos" } },
-        "repo": { "in": "path" },
-        "title": { "in": "body" },
-        "body": { "in": "body" }
-      }
-    }
-  ]
-}
-\`\`\`
-
-### POST /execute — Submit an Action
-
-\`\`\`json
-{
-  "action_id": "create-issue",
-  "code": "const r = await github.createIssue({owner:'amiller', repo:'test', title:args.title, body:args.body});\\nconsole.log(JSON.stringify(r));",
-  "args": { "title": "Test issue", "body": "Created by agent" },
-  "permit_id": "permit_abc123"
-}
-\`\`\`
-
-Agent code calls capability functions (e.g. \`github.createIssue\`) — no direct \`fetch()\` or \`Deno.env.get()\` allowed.
-
-### GET /execute/:id/status?wait=true — Poll for Result
-
-Long-polls up to 120s. Returns on terminal status.
-
-### Other Endpoints
-- \`GET /sessions\` — list active permits
-- \`GET /sessions/:id\` — permit detail
-- \`DELETE /sessions/:id\` — revoke a permit
-- \`POST /secrets\` — \`{ name, value }\`
-- \`GET /secrets\` — list secret names (not values)
-- \`GET /health\` — status check
-
----
-Public URL: ${PUBLIC_URL || '(not configured)'}
-`);
+app.get('/plugins', (_req: Request, res: Response) => {
+  res.json({ plugins: allPlugins().map(p => p.describe()) });
 });
 
 app.get('/health', (_req: Request, res: Response) => res.json({ status: 'ok' }));
@@ -175,6 +117,15 @@ app.post('/secrets', requireTenant, syncTenant, requireOwner, (req: Request, res
   if (!name || !value) return res.status(400).json({ error: 'Missing name or value' });
   db.setSecret(name, value, tenant.tenant_id);
   res.json({ success: true, name });
+});
+
+app.post('/cookies/upload', requireTenant, syncTenant, requireOwner, (req: Request, res: Response) => {
+  const { domain, cookies, user_agent } = req.body;
+  const tenant = (req as any).tenant as TenantContext;
+  if (!domain || !Array.isArray(cookies)) return res.status(400).json({ error: 'Missing domain or cookies array' });
+  const secretName = `COOKIES_${domain.replace(/^www\./, '').replace(/\./g, '_').toUpperCase()}`;
+  db.setSecret(secretName, JSON.stringify({ cookies, user_agent: user_agent || '' }), tenant.tenant_id);
+  res.json({ success: true, secret_name: secretName });
 });
 
 app.get('/secrets', requireTenant, syncTenant, requireOwner, (req: Request, res: Response) => {
@@ -268,6 +219,7 @@ app.get('/approve/:id', (req: Request, res: Response) => {
       missing_secrets: permitReq.secrets.filter(s => !ownerSecretNames.includes(s)),
       capabilities: permitReq.capabilities,
       drafted_capabilities: permitReq.draftedCapabilities,
+      intent: permitReq.intent,
     } : undefined,
     result: request.result ? JSON.parse(request.result) : undefined,
     error: request.error,
@@ -331,6 +283,7 @@ app.post('/approve/:id', async (req: Request, res: Response) => {
     db.updateRequestStatus(id, 'completed');
     notifyStatusWaiters(id);
     console.log(`📋 Permit approved by owner ${ownerId}, session ${permitReq.permitId} ${existingSession ? 'expanded' : 'created'}`);
+
     return res.json({ id, status: 'completed', permit_id: permitReq.permitId, expanded: !!existingSession });
   }
 
@@ -343,12 +296,26 @@ app.post('/approve/:id', async (req: Request, res: Response) => {
 app.get('/session/:id/actions', (req: Request, res: Response) => {
   const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
   const token = req.query.token as string;
-  if (!token) return res.status(401).json({ error: 'Token required' });
-  const scopeReq = (() => {
-    const requests = db.listRecentRequests(100);
-    return requests.find((r: any) => r.skill_url === 'scope' && r.approval_token === token && r.args && JSON.parse(r.args).sessionId === id);
-  })();
-  if (!scopeReq) return res.status(403).json({ error: 'Invalid token for this session' });
+  const auth = req.headers.authorization;
+
+  // Auth: approval_token query param OR Bearer JWT (agent/owner of session)
+  if (token) {
+    const scopeReq = (() => {
+      const requests = db.listRecentRequests(100);
+      return requests.find((r: any) => r.skill_url === 'scope' && r.approval_token === token && r.args && JSON.parse(r.args).sessionId === id);
+    })();
+    if (!scopeReq) return res.status(403).json({ error: 'Invalid token for this session' });
+  } else if (auth) {
+    const jwt = auth.replace(/^Bearer\s+/i, '');
+    const tenant = verifyTokenDirect(jwt);
+    if (!tenant) return res.status(401).json({ error: 'Invalid token' });
+    const session = db.getSession(id);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    if (session.agent_id !== tenant.tenant_id && session.owner_id !== tenant.tenant_id)
+      return res.status(403).json({ error: 'Not authorized for this session' });
+  } else {
+    return res.status(401).json({ error: 'Token required (query param or Authorization header)' });
+  }
   const requests = db.listRecentRequests(50);
   const actions = requests.filter((r: any) => {
     if (r.skill_url === 'scope') return false;
@@ -360,16 +327,110 @@ app.get('/session/:id/actions', (req: Request, res: Response) => {
   res.json({ permit_id: id, actions });
 });
 
+// POST /draft — LLM policy drafting from intent + doc URLs
+app.post('/draft', requireTenant, syncTenant, async (req: Request, res: Response) => {
+  const { intent, doc_urls, secrets: secretHints } = req.body;
+  if (!intent) return res.status(400).json({ error: 'Missing intent' });
+  const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+  if (!ANTHROPIC_API_KEY) return res.status(503).json({ error: 'LLM drafting not configured (no ANTHROPIC_API_KEY)' });
+
+  // Fetch doc content (truncated)
+  let docContent = '';
+  for (const url of (doc_urls || []).slice(0, 3)) {
+    try {
+      const r = await fetch(url, { headers: { 'User-Agent': 'oauth3-tee/1.0' }, signal: AbortSignal.timeout(10000) });
+      if (r.ok) docContent += `\n--- ${url} ---\n${(await r.text()).slice(0, 8000)}\n`;
+    } catch {}
+  }
+
+  const plugin = getPlugin('scoped-fetch')!;
+  const schema = JSON.stringify(plugin.describe().spec_schema, null, 2);
+
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({
+      model: 'claude-haiku-4-5-20251001', max_tokens: 1024,
+      system: `You are a security policy drafter inside a TEE. Given the user's intent and optional API docs, draft a minimal scoped-fetch capability spec. Respond with ONLY a JSON object.\n\nSchema fields:\n${schema}\n\nRules:\n- Use the narrowest scope globs possible\n- Only include write methods if the goal requires mutation\n- Use body_schema.allow_keys to restrict request bodies to only needed fields\n- Add rate_limit if appropriate\n- Do NOT use response_filter — that is for owners to configure manually\n- Reference secrets as {SECRET_NAME} in auth.value`,
+      messages: [{ role: 'user', content: `Intent: ${intent}\n${secretHints?.length ? `Available secrets: ${secretHints.join(', ')}` : ''}\n${docContent ? `API documentation:\n${docContent}` : ''}` }],
+    }),
+  });
+  if (!r.ok) return res.status(502).json({ error: `LLM API error: ${r.status}` });
+  const llmRes = await r.json() as any;
+  const text = llmRes.content?.[0]?.text || '';
+
+  // Extract JSON from response
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) return res.status(502).json({ error: 'LLM did not return valid JSON', raw: text });
+
+  try {
+    const drafted = JSON.parse(jsonMatch[0]);
+    drafted.type = 'scoped-fetch';
+    const plugin = getPlugin('scoped-fetch')!;
+    const v = plugin.validateSpec(drafted);
+    if (!v.valid) return res.json({ drafted_capabilities: [drafted], validation_errors: v.errors, rationale: text });
+    res.json({ drafted_capabilities: [drafted], rationale: text.replace(jsonMatch[0], '').trim() || undefined });
+  } catch (e: any) {
+    res.status(502).json({ error: 'Failed to parse LLM JSON', raw: text });
+  }
+});
+
+// Draft a single intent item into a scoped-fetch spec via LLM
+async function draftIntent(item: { name: string; goal: string; doc_urls?: string[]; secret_hints?: string[] }): Promise<any> {
+  const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+  if (!ANTHROPIC_API_KEY) throw new Error('LLM drafting not configured (no ANTHROPIC_API_KEY)');
+
+  let docContent = '';
+  for (const url of (item.doc_urls || []).slice(0, 3)) {
+    try {
+      const r = await fetch(url, { headers: { 'User-Agent': 'oauth3-tee/1.0' }, signal: AbortSignal.timeout(10000) });
+      if (r.ok) docContent += `\n--- ${url} ---\n${(await r.text()).slice(0, 8000)}\n`;
+    } catch {}
+  }
+
+  const plugin = getPlugin('scoped-fetch')!;
+  const schema = JSON.stringify(plugin.describe().spec_schema, null, 2);
+
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({
+      model: 'claude-haiku-4-5-20251001', max_tokens: 1024,
+      system: `You are a security policy drafter inside a TEE. Given the user's goal and optional API docs, draft a minimal scoped-fetch capability spec. Respond with ONLY a JSON object.\n\nSchema fields:\n${schema}\n\nRules:\n- Use the narrowest scope globs possible\n- Only include write methods (POST/PUT/PATCH/DELETE) if the goal requires mutation\n- Use body_schema.allow_keys to restrict request bodies to only needed fields\n- Add rate_limit if the goal doesn't require high throughput\n- Do NOT use response_filter — that is for owners to configure manually\n- Reference secrets as {SECRET_NAME} in auth.value`,
+      messages: [{ role: 'user', content: `Goal: ${item.goal}\nName: ${item.name}\n${item.secret_hints?.length ? `Available secrets: ${item.secret_hints.join(', ')}` : ''}\n${docContent ? `API documentation:\n${docContent}` : ''}` }],
+    }),
+  });
+  if (!r.ok) throw new Error(`LLM API error: ${r.status}`);
+  const llmRes = await r.json() as any;
+  const text = llmRes.content?.[0]?.text || '';
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) throw new Error('LLM did not return valid JSON');
+  const drafted = JSON.parse(jsonMatch[0]);
+  drafted.type = 'scoped-fetch';
+  drafted.drafted_by = 'tee';
+  return drafted;
+}
+
 // POST /permit (was /scope)
 app.post('/permit', requireTenant, syncTenant, async (req: Request, res: Response) => {
   try {
-    const { permit_id: clientPermitId, description, capabilities: rawCapabilities } = req.body;
+    let { permit_id: clientPermitId, description, capabilities: rawCapabilities, networks: extraNetworks, intent } = req.body;
     if (!description) return res.status(400).json({ error: 'Missing description' });
-    if (!Array.isArray(rawCapabilities) || !rawCapabilities.length) return res.status(400).json({ error: 'Missing capabilities array' });
+
+    // Intent-based flow: draft capabilities from intent array
+    if (Array.isArray(intent) && intent.length && !rawCapabilities) {
+      try {
+        rawCapabilities = await Promise.all(intent.map(draftIntent));
+      } catch (e: any) {
+        return res.status(502).json({ error: `Intent drafting failed: ${e.message}` });
+      }
+    }
+
+    if (!Array.isArray(rawCapabilities) || !rawCapabilities.length) return res.status(400).json({ error: 'Missing capabilities array (or provide intent array for LLM drafting)' });
 
     const permitId = clientPermitId || `permit_${randomBytes(8).toString('hex')}`;
     let secretsList: string[] = [];
-    let networksList: string[] = [];
+    let networksList: string[] = Array.isArray(extraNetworks) ? [...extraNetworks] : [];
 
     // Validate specs via plugins, auto-derive secrets/networks, generate code
     const capabilitySpecs: CapabilitySpec[] = [];
@@ -377,8 +438,13 @@ app.post('/permit', requireTenant, syncTenant, async (req: Request, res: Respons
 
     for (const raw of rawCapabilities) {
       const pluginType = raw.type || 'api-gateway';
+      if (pluginType === 'api-gateway' || pluginType === 'cookie-session')
+        console.warn(`⚠️  Plugin "${pluginType}" is deprecated — use scoped-fetch instead`);
       const plugin = getPlugin(pluginType);
-      if (!plugin) return res.status(400).json({ error: `Unknown capability type: ${pluginType}` });
+      if (!plugin) {
+        const available = allPlugins().map(p => p.type)
+        return res.status(400).json({ error: `Unknown capability type: "${pluginType}". Available types: ${available.join(', ')}. Call GET /plugins for details.` })
+      }
 
       const v = plugin.validateSpec(raw);
       if (!v.valid) return res.status(400).json({ error: `Invalid capability spec "${raw.name}": ${v.errors.join(', ')}` });
@@ -411,7 +477,7 @@ app.post('/permit', requireTenant, syncTenant, async (req: Request, res: Respons
     const requestId = `permit_${randomBytes(8).toString('hex')}`;
     const approvalToken = randomBytes(32).toString('hex');
     const tenant = (req as any).tenant as TenantContext;
-    const scopeData = JSON.stringify({ description, secrets: secretsList, networks: networksList, capabilities: capabilitySpecs, draftedCapabilities, agentId: tenant.tenant_id });
+    const scopeData = JSON.stringify({ description, secrets: secretsList, networks: networksList, capabilities: capabilitySpecs, draftedCapabilities, agentId: tenant.tenant_id, intent: intent || undefined });
 
     db.createRequest(requestId, 'permit-request', 'scope', hashCode(scopeData), secretsList, { sessionId: permitId, description }, approvalToken);
     db.storeCode(requestId, scopeData);
@@ -483,10 +549,16 @@ app.post('/execute', requireTenant, syncTenant, async (req: Request, res: Respon
       })),
     };
 
+    // Rebuild endowments from specs (endowments are functions, not serializable)
+    const caps = await Promise.all(session.policy.capabilities.map(async (c) => {
+      const plugin = getPlugin(c.spec?.type || 'api-gateway');
+      if (!plugin || !c.spec) return c;
+      const result = await plugin.codegen(c.spec);
+      return { ...c, endowment: result.endowment };
+    }));
+
     db.updateRequestStatus(requestId, 'approved');
-    const capDefs = session.policy.capabilities.map(c => c.code).join('\n\n');
-    const execCode = capDefs + '\n\n// --- Agent code ---\n' + actionCode;
-    executeInBackground(requestId, execCode, session.policy.allowedNetworks, secretsList, session.owner_id, args, enforcement);
+    executeInBackground(requestId, actionCode, caps, secretsList, session.owner_id, args, enforcement);
     const statusUrl = PUBLIC_URL ? `${PUBLIC_URL}/execute/${requestId}/status?wait=true` : undefined;
     return res.json({ request_id: requestId, status: 'approved', permit_id: effectivePermitId, status_url: statusUrl, message: 'Auto-approved (capability mode)' });
   } catch (error: any) {
@@ -534,40 +606,67 @@ async function handleStatus(req: Request, res: Response) {
   const request = db.getRequest(id);
   if (!request) return res.status(404).json({ error: 'Request not found' });
 
-  const wantWait = req.query.wait === 'true' || req.query.wait === '1';
+  const wantWait = String(req.query.wait || '').startsWith('true') || req.query.wait === '1';
+  const maxWait = Math.min(parseInt(req.query.timeout as string) || 600_000, 600_000); // default 10min, max 10min
   const terminal = ['completed', 'failed', 'denied'];
 
   if (wantWait && !terminal.includes(request.status)) {
+    // Single 50s wait — must respond before nginx 60s gateway timeout.
+    // Client should retry fetch(status_url) in a loop until status is terminal.
     await new Promise<void>(resolve => {
-      const timeout = setTimeout(resolve, 120_000);
+      const timeout = setTimeout(resolve, 50_000);
       const entry = () => { clearTimeout(timeout); resolve(); };
       if (!statusWaiters.has(id)) statusWaiters.set(id, []);
       statusWaiters.get(id)!.push(entry);
     });
-    const updated = db.getRequest(id);
-    if (updated) return res.json(buildStatusResponse(updated));
   }
 
-  res.json(buildStatusResponse(request));
+  const latest = db.getRequest(id);
+  res.json(buildStatusResponse(latest || request));
 }
 
+// Raw stdout endpoint — no JSON wrapping, streamable, avoids client response size limits
+app.get('/execute/:id/stdout', (req: Request, res: Response) => {
+  const id = typeof req.params.id === 'string' ? req.params.id : req.params.id[0];
+  const token = req.query.token as string;
+  const auth = req.headers.authorization;
+
+  // Auth: token query param or Bearer JWT
+  if (token) {
+    const request = db.getRequest(id);
+    if (!request || request.approval_token !== token) return res.status(403).json({ error: 'Invalid token' });
+  } else if (auth) {
+    const tenant = verifyTokenDirect(auth.replace(/^Bearer\s+/i, ''));
+    if (!tenant) return res.status(401).json({ error: 'Invalid token' });
+  } else {
+    return res.status(401).json({ error: 'Auth required' });
+  }
+
+  const request = db.getRequest(id);
+  if (!request) return res.status(404).json({ error: 'Not found' });
+  if (!request.result) return res.status(202).json({ status: request.status, message: 'Not yet complete' });
+
+  const result = JSON.parse(request.result);
+  res.setHeader('Content-Type', 'text/plain');
+  res.setHeader('X-Exit-Code', String(result.exitCode ?? ''));
+  res.setHeader('X-Duration-Ms', String(result.duration ?? ''));
+  res.setHeader('X-Success', String(result.success ?? ''));
+  res.send(result.stdout || '');
+});
+
 // Background execution
-async function executeInBackground(requestId: string, code: string, allowedNetworks: string[], requiredSecrets: string[], ownerId: string | null, args?: Record<string, any>, enforcement?: any) {
+async function executeInBackground(requestId: string, code: string, capabilities: CapabilityFunction[], requiredSecrets: string[], ownerId: string | null, args?: Record<string, any>, enforcement?: any) {
   console.log(`\n🚀 Starting background execution for ${requestId}`);
   try {
     db.updateRequestStatus(requestId, 'executing');
     const dbRequest = db.getRequest(requestId);
     const execArgs = args || (dbRequest?.args ? JSON.parse(dbRequest.args) : {});
 
-    // Load secrets from owner's vault
     const ownerSecrets = ownerId ? db.getSecretsByOwner(ownerId) : {};
-    // Also check legacy secrets for backward compat
-    const legacySecrets = db.getSecretsByOwner('legacy');
     const secretValues: Record<string, string> = {};
     const missingSecrets: string[] = [];
     for (const name of requiredSecrets) {
       if (ownerSecrets[name]) secretValues[name] = ownerSecrets[name];
-      else if (legacySecrets[name]) secretValues[name] = legacySecrets[name];
       else missingSecrets.push(name);
     }
 
@@ -578,7 +677,7 @@ async function executeInBackground(requestId: string, code: string, allowedNetwo
       return;
     }
 
-    const result = await execute({ code, secrets: secretValues, args: execArgs, timeout: 30, allowedNetworks });
+    const result = await execute({ code, secrets: secretValues, args: execArgs, timeout: 30, capabilities });
     console.log(`  Execution complete:`, result.success ? '✅' : '❌');
 
     const resultData: any = {
@@ -588,7 +687,7 @@ async function executeInBackground(requestId: string, code: string, allowedNetwo
     if (enforcement) {
       resultData.enforcement = {
         ...enforcement,
-        sandbox: { allowNet: allowedNetworks, allowEnv: [...requiredSecrets, ...Object.keys(execArgs).filter(k => !k.startsWith('_'))] },
+        sandbox: { type: 'ses-compartment', endowments: capabilities.map(c => c.name) },
         runtime: { exitCode: result.exitCode, duration: result.duration },
       };
     }
@@ -603,7 +702,8 @@ async function executeInBackground(requestId: string, code: string, allowedNetwo
 
 // JSON 404
 app.use((_req: Request, res: Response) => {
-  res.status(404).json({ error: 'Not found', hint: 'GET / for API documentation' });
+  const orchUrl = ORCHESTRATOR_URL || undefined;
+  res.status(404).json({ error: 'Not found', docs: orchUrl ? `${orchUrl}/tee-docs` : 'GET / for endpoints' });
 });
 
 setInterval(() => db.cleanupExpired(), 60 * 60 * 1000);
@@ -611,7 +711,7 @@ setInterval(() => db.cleanupExpired(), 60 * 60 * 1000);
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Execution Proxy running on port ${PORT}`);
   console.log(`📊 Database: ${DB_PATH}`);
-  console.log(`⚙️  Executor: ${EXECUTOR_MODE} mode`);
+  console.log(`⚙️  Executor: SES Compartment`);
   console.log(`🔗 Public URL: ${PUBLIC_URL || '(not set)'}`);
 });
 

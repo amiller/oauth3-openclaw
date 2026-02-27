@@ -1,20 +1,31 @@
-import { CapabilityPlugin, PluginCodegenResult, ApiGatewaySpec, EndowmentFactory } from './types.js'
+import { CapabilityPlugin, PluginCodegenResult, EndowmentFactory } from './types.js'
+import { PolicyConstraint } from '../capability.js'
+
+export interface CookieSessionSpec {
+  type: 'cookie-session'
+  name: string
+  doc_url: string
+  doc_nav?: string
+  cookie_secret: string
+  endpoint: string
+  method: 'GET' | 'POST' | 'PUT' | 'DELETE'
+  params: Record<string, { in: 'path' | 'body' | 'query'; constraint?: PolicyConstraint }>
+  extra_headers?: Record<string, string>
+  response?: 'json' | 'text'
+}
 
 function validate(spec: any): { valid: boolean; errors: string[] } {
   const errors: string[] = []
   if (!spec || typeof spec !== 'object') return { valid: false, errors: ['spec must be an object'] }
   if (typeof spec.name !== 'string' || !spec.name) errors.push('name required')
   if (typeof spec.doc_url !== 'string' || !spec.doc_url) errors.push('doc_url required')
+  if (typeof spec.cookie_secret !== 'string' || !spec.cookie_secret) errors.push('cookie_secret required')
   if (typeof spec.endpoint !== 'string' || !spec.endpoint) errors.push('endpoint required')
-  if (!['GET', 'POST', 'PUT', 'DELETE', 'PATCH'].includes(spec.method)) errors.push('method must be GET/POST/PUT/DELETE/PATCH')
+  if (!['GET', 'POST', 'PUT', 'DELETE'].includes(spec.method)) errors.push('method must be GET/POST/PUT/DELETE')
   if (!spec.params || typeof spec.params !== 'object') errors.push('params required')
   if (spec.name && /[^a-zA-Z0-9._-]/.test(spec.name)) errors.push('name must be alphanumeric/dots/dashes')
   try { new URL(spec.doc_url) } catch { errors.push('doc_url must be a valid URL') }
   try { new URL(spec.endpoint.replace(/\{[^}]+\}/g, 'x')) } catch { errors.push('endpoint must be a valid URL template') }
-  if (spec.auth) {
-    if (typeof spec.auth.header !== 'string') errors.push('auth.header must be string')
-    if (typeof spec.auth.value !== 'string') errors.push('auth.value must be string')
-  }
   if (spec.params && typeof spec.params === 'object') {
     for (const [k, v] of Object.entries(spec.params) as [string, any][]) {
       if (!['path', 'body', 'query'].includes(v?.in)) errors.push(`params.${k}.in must be path/body/query`)
@@ -23,19 +34,14 @@ function validate(spec: any): { valid: boolean; errors: string[] } {
   return { valid: errors.length === 0, errors }
 }
 
-function secrets(spec: ApiGatewaySpec): string[] {
-  if (!spec.auth?.value) return []
-  const matches = spec.auth.value.matchAll(/\{([A-Z_][A-Z0-9_]*)\}/g)
-  return [...new Set([...matches].map(m => m[1]))]
-}
+function secrets(spec: CookieSessionSpec): string[] { return [spec.cookie_secret] }
 
-function networks(spec: ApiGatewaySpec): string[] {
+function networks(spec: CookieSessionSpec): string[] {
   try { return [new URL(spec.endpoint.replace(/\{[^}]+\}/g, 'x')).hostname] } catch { return [] }
 }
 
-function summarize(spec: ApiGatewaySpec): string {
-  const domain = (() => { try { return new URL(spec.doc_url).hostname } catch { return spec.doc_url } })()
-  const s = secrets(spec)
+function summarize(spec: CookieSessionSpec): string {
+  const domain = (() => { try { return new URL(spec.endpoint.replace(/\{[^}]+\}/g, 'x')).hostname } catch { return spec.endpoint } })()
   const constraints = Object.entries(spec.params)
     .filter(([, v]) => v.constraint)
     .map(([k, v]) => {
@@ -45,14 +51,14 @@ function summarize(spec: ApiGatewaySpec): string {
       return `${k}: ${(c as any).rule}`
     })
   return [
-    `${spec.method} ${spec.endpoint}`,
+    `Cookie-auth ${spec.method} ${spec.endpoint}`,
     constraints.length ? `constrained: ${constraints.join(', ')}` : null,
-    s.length ? `uses ${s.join(', ')}` : null,
+    `using ${spec.cookie_secret}`,
     `docs: ${domain}`,
   ].filter(Boolean).join(' — ')
 }
 
-function codegen(spec: ApiGatewaySpec): Promise<PluginCodegenResult> {
+function codegen(spec: CookieSessionSpec): Promise<PluginCodegenResult> {
   const params = Object.entries(spec.params)
   const pathP = params.filter(([, v]) => v.in === 'path')
   const bodyP = params.filter(([, v]) => v.in === 'body')
@@ -62,6 +68,14 @@ function codegen(spec: ApiGatewaySpec): Promise<PluginCodegenResult> {
   const sigParams = params.map(([n]) => `${n}: string`).join(', ')
   const signature = `async function ${fnName}(${sigParams}): Promise<any>`
   const L: string[] = [`${signature} {`]
+
+  // Parse cookie secret
+  L.push(`  const _raw = Deno.env.get(${JSON.stringify(spec.cookie_secret)});`)
+  L.push(`  if (!_raw) throw new Error("missing secret ${spec.cookie_secret}");`)
+  L.push(`  const _sec = JSON.parse(_raw);`)
+  L.push(`  const _domain = new URL(\`${spec.endpoint.replace(/\{(\w+)\}/g, (_m, k) => '${' + k + '}')}\`).hostname;`)
+  L.push(`  const _cookies = _sec.cookies.filter((c: any) => _domain.endsWith(c.domain.replace(/^\\./, "")));`)
+  L.push(`  const _cookieStr = _cookies.map((c: any) => c.name + "=" + c.value).join("; ");`)
 
   // Constraint validation
   for (const [name, p] of params) {
@@ -84,35 +98,29 @@ function codegen(spec: ApiGatewaySpec): Promise<PluginCodegenResult> {
   }
 
   // Headers
-  const hdrs: string[] = []
-  if (spec.auth) {
-    const val = spec.auth.value.replace(/\{([A-Z_][A-Z0-9_]*)\}/g, (_m, k) => '${Deno.env.get("' + k + '")}')
-    hdrs.push(`"${spec.auth.header}": \`${val}\``)
-  }
+  const extraHdrs = spec.extra_headers
+    ? Object.entries(spec.extra_headers).map(([k, v]) => `${JSON.stringify(k)}: ${JSON.stringify(v)}`).join(', ')
+    : ''
+  const hdrParts = [`"Cookie": _cookieStr`, `"User-Agent": _sec.user_agent`]
+  if (extraHdrs) hdrParts.push(extraHdrs)
 
   // Fetch
-  const fetchOpts: string[] = [`method: "${spec.method}"`, `headers: {${hdrs.join(', ')}}`]
+  const fetchOpts: string[] = [`method: "${spec.method}"`, `headers: {${hdrParts.join(', ')}}`]
   if (bodyP.length) {
-    hdrs.push(`"Content-Type": "application/json"`)
-    fetchOpts[1] = `headers: {${hdrs.join(', ')}}`
+    hdrParts.push(`"Content-Type": "application/json"`)
+    fetchOpts[1] = `headers: {${hdrParts.join(', ')}}`
     const bodyFields = bodyP.map(([n]) => n).join(', ')
-    if (spec.rpc_wrap)
-      L.push(`  const _body = JSON.stringify({jsonrpc:"2.0",method:${JSON.stringify(spec.rpc_method)},params:{${bodyFields}},id:1});`)
-    else
-      L.push(`  const _body = JSON.stringify({${bodyFields}});`)
+    L.push(`  const _body = JSON.stringify({${bodyFields}});`)
     fetchOpts.push(`body: _body`)
   }
 
   L.push(`  const _r = await fetch(_url, {${fetchOpts.join(', ')}});`)
   L.push(`  if (!_r.ok) { const _e = await _r.text(); throw new Error(\`HTTP \${_r.status}: \${_e}\`); }`)
-  const retLine = spec.response === 'binary'
-    ? `  return Buffer.from(await _r.arrayBuffer()).toString('base64');`
-    : spec.response === 'text' ? `  return _r.text();` : `  return _r.json();`
-  L.push(retLine)
+  L.push(spec.response === 'text' ? `  return _r.text();` : `  return _r.json();`)
   L.push(`}`)
 
   const endowment: EndowmentFactory = {
-    build(secrets: Record<string, string>) {
+    build(secretsMap: Record<string, string>) {
       return async (...callArgs: any[]) => {
         const paramEntries = Object.entries(spec.params)
         const argMap: Record<string, string> = {}
@@ -128,36 +136,38 @@ function codegen(spec: ApiGatewaySpec): Promise<PluginCodegenResult> {
             throw new Error(`${name}: ${c.rationale}`)
         }
 
+        const raw = secretsMap[spec.cookie_secret]
+        if (!raw) throw new Error(`missing secret ${spec.cookie_secret}`)
+        const sec = JSON.parse(raw)
+
         let url = spec.endpoint.replace(/\{(\w+)\}/g, (_, k) => argMap[k])
-        const queryP = paramEntries.filter(([, v]) => v.in === 'query')
+        const reqDomain = new URL(url).hostname
+        const cookies = sec.cookies.filter((c: any) => reqDomain.endsWith(c.domain.replace(/^\./, '')))
+        const cookieStr = cookies.map((c: any) => `${c.name}=${c.value}`).join('; ')
+
         if (queryP.length) {
           const u = new URL(url)
           for (const [n] of queryP) if (argMap[n] !== undefined) u.searchParams.set(n, argMap[n])
           url = u.toString()
         }
 
-        const headers: Record<string, string> = {}
-        if (spec.auth) {
-          headers[spec.auth.header] = spec.auth.value.replace(
-            /\{([A-Z_][A-Z0-9_]*)\}/g, (_, k) => secrets[k] || ''
-          )
+        const headers: Record<string, string> = {
+          'Cookie': cookieStr,
+          'User-Agent': sec.user_agent,
+          ...spec.extra_headers,
         }
 
-        const bodyP = paramEntries.filter(([, v]) => v.in === 'body')
         const opts: RequestInit = { method: spec.method, headers }
-        if (bodyP.length) {
+        const bodyParams = paramEntries.filter(([, v]) => v.in === 'body')
+        if (bodyParams.length) {
           headers['Content-Type'] = 'application/json'
           const bodyObj: Record<string, any> = {}
-          for (const [n] of bodyP) bodyObj[n] = argMap[n]
-          if (spec.rpc_wrap)
-            opts.body = JSON.stringify({ jsonrpc: '2.0', method: spec.rpc_method, params: bodyObj, id: 1 })
-          else
-            opts.body = JSON.stringify(bodyObj)
+          for (const [n] of bodyParams) bodyObj[n] = argMap[n]
+          opts.body = JSON.stringify(bodyObj)
         }
 
         const r = await fetch(url, opts)
         if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`)
-        if (spec.response === 'binary') return Buffer.from(await r.arrayBuffer()).toString('base64')
         return spec.response === 'text' ? r.text() : r.json()
       }
     }
@@ -166,22 +176,24 @@ function codegen(spec: ApiGatewaySpec): Promise<PluginCodegenResult> {
   return Promise.resolve({ code: L.join('\n'), signature, endowment })
 }
 
-export const apiGatewayPlugin: CapabilityPlugin = {
-  type: 'api-gateway',
+export const cookieSessionPlugin: CapabilityPlugin = {
+  type: 'cookie-session',
   describe: () => ({
-    type: 'api-gateway',
-    description: 'DEPRECATED — use scoped-fetch instead. Single-endpoint HTTP proxy with param constraints.',
+    type: 'cookie-session',
+    description: 'DEPRECATED — use scoped-fetch with cookie_secret instead. Single-endpoint cookie-auth proxy.',
     spec_schema: {
-      type: '"api-gateway"', name: 'string', doc_url: 'string', endpoint: 'string (URL template with {placeholders})',
-      method: 'GET|POST|PUT|DELETE|PATCH',
-      auth: '{ header: string, value: string (use {SECRET_NAME} for secret refs) } (optional)',
-      params: 'Record<name, { in: "path"|"body"|"query", constraint?: { type, pattern?, op?, value?, rationale } }>',
+      type: '"cookie-session"', name: 'string', doc_url: 'string',
+      cookie_secret: 'string (name of stored cookie secret)',
+      endpoint: 'string (URL template)', method: 'GET|POST|PUT|DELETE',
+      params: 'Record<name, { in: "path"|"body"|"query" }>',
+      extra_headers: 'Record<string,string> (optional)',
     },
     example_spec: {
-      type: 'api-gateway', name: 'github-list-issues', doc_url: 'https://docs.github.com/en/rest/issues',
-      endpoint: 'https://api.github.com/repos/{owner}/{repo}/issues',
-      method: 'GET', auth: { header: 'Authorization', value: 'Bearer {GITHUB_TOKEN}' },
-      params: { owner: { in: 'path' }, repo: { in: 'path' }, state: { in: 'query' } },
+      type: 'cookie-session', name: 'reddit-saved',
+      doc_url: 'https://www.reddit.com/dev/api/',
+      cookie_secret: 'COOKIES_REDDIT_COM',
+      endpoint: 'https://www.reddit.com/user/{username}/saved.json',
+      method: 'GET', params: { username: { in: 'path' }, limit: { in: 'query' } },
     },
   }),
   validateSpec: validate,
