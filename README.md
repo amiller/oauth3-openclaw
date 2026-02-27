@@ -1,127 +1,146 @@
 # OAuth3 Enclave
 
-A TEE (Trusted Execution Environment) that holds API keys on behalf of AI agents. Agents describe what they want to do, the enclave drafts a minimal security policy, a human approves it, and agent code runs in a locked-down sandbox with only the approved capabilities injected. Keys never leave the enclave.
+Your agent's API keys don't belong on your agent's machine. This runs inside a TEE and holds secrets on behalf of AI agents — agents describe what they want to do, a human approves a scoped policy, and code runs in a sandbox with only the approved capabilities injected.
 
 ```
-Your machine                          TEE (Trusted Execution Environment)
+Agent                                 TEE
 ┌──────────┐                    ┌─────────────────────────────┐
-│  Agent   │── POST /permit ───►│  OAuth3 Enclave             │
-│          │   "I want to       │  ├─ drafts scoped policy    │
-│          │    create issues"  │  ├─ human approves in browser│
-│          │                    │  ├─ holds keys in vault      │
-│          │── POST /execute ──►│  ├─ runs code in SES sandbox │
-│          │◄── result ─────────│  └─ only approved ops work   │
+│  Agent   │── POST /permit ───►│  drafts scoped policy       │
+│          │                    │  human approves in browser   │
+│          │── POST /execute ──►│  runs code in SES sandbox    │
+│          │◄── result ─────────│  keys never leave the enclave│
 └──────────┘                    └─────────────────────────────┘
 ```
 
-## Run locally
+## Quick start
 
 ```bash
 cd proxy
 npm install
-cp .env.example .env
-# Edit .env — set JWT_SECRET, optionally ANTHROPIC_API_KEY for LLM drafting
-
 npm run dev
-# → http://localhost:3737
 ```
 
-Or with Docker Compose (includes Postgres):
+No config needed for local dev — JWT secrets auto-generate and SQLite is embedded. Set `ANTHROPIC_API_KEY` in a `.env` file if you want the enclave to auto-draft policies from natural language intent (otherwise you pass capability specs directly).
+
+### Sign up and get a token
+
+```bash
+# Get an agent token
+curl -s -X POST http://localhost:3737/signup \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-agent"}' | jq .
+# → { "token": "...", "tenant_id": "..." }
+
+# Get an owner token (can approve permits and manage secrets)
+curl -s -X POST http://localhost:3737/signup \
+  -H "Content-Type: application/json" \
+  -d '{"name": "me", "role": "owner"}' | jq .
+```
+
+### Store a secret, request a permit, approve it, execute
+
+```bash
+TOKEN=<agent_token>
+OWNER=<owner_token>
+
+# Store a GitHub token as the owner
+curl -s -X POST http://localhost:3737/secrets \
+  -H "Authorization: Bearer $OWNER" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "GITHUB_TOKEN", "value": "ghp_..."}'
+
+# Agent requests a permit with a capability spec
+curl -s -X POST http://localhost:3737/permit \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "description": "List GitHub issues",
+    "capabilities": [{
+      "type": "scoped-fetch",
+      "name": "github",
+      "base_url": "https://api.github.com",
+      "scope": ["/repos/OWNER/REPO/issues"],
+      "auth": {"header": "Authorization", "value": "Bearer {GITHUB_TOKEN}"}
+    }]
+  }' | jq .
+# → { "request_id": "...", "approval_url": "...", "permit_id": "..." }
+
+# Approve it (in production this happens in the browser)
+curl -s -X POST http://localhost:3737/approve/<request_id> \
+  -H "Content-Type: application/json" \
+  -d '{"owner_token": "'$OWNER'", "action": "approve"}'
+
+# Execute code under the permit
+curl -s -X POST http://localhost:3737/execute \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "permit_id": "<permit_id>",
+    "action_id": "list-issues",
+    "code": "const r = await github(\"GET\", \"/repos/OWNER/REPO/issues\"); console.log(JSON.stringify(r));"
+  }' | jq .
+# → { "request_id": "...", "status_url": "..." }
+
+# Poll for result
+curl -s http://localhost:3737/execute/<request_id>/status?wait=true | jq .
+```
+
+The agent code runs in an SES sandbox — no `fetch()`, no `require()`, no env vars. Only the `github()` function from the approved permit is available.
+
+## Docker (with Postgres)
 
 ```bash
 cd proxy
 docker compose -f docker-compose.dev.yml up
-# → proxy on :3000, postgres on :5432
-```
-
-Hit the root endpoint to see all available routes and a quick-start guide:
-
-```bash
-curl http://localhost:3737/
+# proxy on :3000, postgres on :5432
 ```
 
 ## Deploy to a TEE (dstack)
 
-Requires [dstack](https://docs.phala.network/dstack/overview) or any TEE-capable host.
+For production on [dstack](https://docs.phala.network/dstack/overview) (Phala CVM):
 
 ```bash
-# Configure
 cp dstack/.env.staging dstack/.env
-# Edit dstack/.env — set JWT_SECRET, ANTHROPIC_API_KEY, PG_PASSWORD, DOMAIN, CLOUDFLARE_API_TOKEN
+# Edit: JWT_SECRET, ANTHROPIC_API_KEY, PG_PASSWORD, DOMAIN, CLOUDFLARE_API_TOKEN
 
-# Build and push (digests, not tags — attestation requires exact image match)
 docker build -t ghcr.io/YOUR_USER/oauth3-proxy:latest proxy/
 docker push ghcr.io/YOUR_USER/oauth3-proxy:latest
+# Pin the digest (attestation requires exact image match):
 docker inspect ghcr.io/YOUR_USER/oauth3-proxy:latest --format '{{index .RepoDigests 0}}'
-# Update the digest in dstack/docker-compose.yml
+# Update digest in dstack/docker-compose.yml
 
-# Deploy
 phala deploy --cvm-id <VM_UUID> -c dstack/docker-compose.yml -e dstack/.env
 ```
 
-The CVM runs: dstack-ingress (HTTPS + attestation via Cloudflare) → oauth3-proxy → postgres.
-
-## API overview
-
-| Endpoint | Description |
-|---|---|
-| `GET /` | Discovery — lists all endpoints, plugins, quick-start |
-| `POST /signup` | Get an agent or owner token |
-| `POST /permit` | Request capabilities (intent-based or direct specs) |
-| `POST /execute` | Run code under an approved permit |
-| `GET /execute/:id/status?wait=true` | Long-poll for execution result |
-| `GET /approve/:id` | Approval details (for human review UI) |
-| `POST /approve/:id` | Approve/deny a permit |
-| `POST /secrets` | Store a secret (owner only) |
-| `GET /sessions` | List active permits |
-| `POST /cookies/upload` | Upload browser cookies from extension |
-| `GET /plugins` | List capability plugins with schemas |
-
-The enclave is self-documenting — `GET /` returns everything an agent needs to get started.
-
 ## Security model
 
-- **TEE isolation** — runs on [dstack](https://docs.phala.network/dstack/overview) (Phala CVM). Remote attestation proves the code running is the code you audited
-- **SES Compartments** — agent code executes in a locked-down JavaScript sandbox. No `fetch()`, no `require()`, no env vars
-- **Scoped endowments** — each approved API gets a function scoped to specific URL patterns, HTTP methods, and body fields
-- **Human-in-the-loop** — every new scope requires explicit human approval
-- **Key custody** — secrets stored in the enclave's database, injected into endowments at execution time, never returned to the agent
-
-## How it works
-
-1. **Agent describes intent** — "I want to create GitHub issues" + relevant doc URLs
-2. **Enclave drafts policy** — LLM produces a scoped-fetch spec (restricted URLs, methods, body fields, rate limits)
-3. **Human reviews** — approval page shows intent alongside the drafted policy
-4. **Agent submits code** — runs in an SES sandbox with only the approved API endowments
-5. **No ambient authority** — only the named functions from the permit are available
-
-Permits are reusable — approve once, execute many times under the same session.
+- **TEE isolation** — remote attestation proves the code running is the code you audited
+- **SES Compartments** — agent code runs in a hardened JavaScript sandbox with zero ambient authority
+- **Scoped endowments** — each capability is a function locked to specific URL patterns, methods, and body fields
+- **Human-in-the-loop** — every new scope requires explicit approval
+- **Key custody** — secrets live in the enclave, injected at execution time, never returned to the agent
 
 ## Project structure
 
 ```
 proxy/src/
 ├── server.ts           # HTTP API — all routes
-├── executor.ts         # SES Compartment execution with endowment injection
-├── database.ts         # SQLite schema (sessions, secrets, capabilities, executions)
+├── executor.ts         # SES Compartment execution
+├── database.ts         # SQLite schema
 ├── postgres.ts         # Optional PostgreSQL for production
 ├── auth.ts             # JWT auth (agent/owner roles)
 ├── capability.ts       # Spec types, plugin re-exports
 └── plugins/
     ├── types.ts        # CapabilityPlugin interface
     ├── registry.ts     # Plugin registration
-    ├── scoped-fetch.ts # Glob-scoped HTTP client (main plugin)
-    ├── cookie-session.ts # Cookie-based auth plugin
-    └── tiktok-history.ts # Read-only TikTok plugin
+    ├── scoped-fetch.ts # Glob-scoped HTTP client
+    ├── cookie-session.ts
+    └── tiktok-history.ts
 dstack/
-├── docker-compose.yml  # CVM deployment (ingress + proxy + postgres + ssh)
-├── .env.staging        # Staging env template
-└── .env.production     # Production env template
+├── docker-compose.yml  # CVM deployment
+├── .env.staging        # Env template
+└── .env.production
 ```
-
-## For agents
-
-Use the [`oauth3-skill`](https://www.npmjs.com/package/oauth3-skill) SDK to integrate your agent with an enclave. It handles signup, permit requests, polling, and execution.
 
 ## License
 
